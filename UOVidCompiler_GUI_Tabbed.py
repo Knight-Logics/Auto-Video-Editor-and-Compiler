@@ -45,8 +45,8 @@ class UOVidCompilerGUI:
     """Main application with tabbed interface"""
     
     # Version info for auto-updates
-    VERSION = "1.2.0"  # Updated for tabbed interface
-    GITHUB_REPO = "Nicholasjknight/Auto-Video-Editor-and-Compiler"
+    VERSION = "1.2.1"  # Updated for tabbed interface
+    GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"
     
     # Donation addresses
     DONATION_INFO = {

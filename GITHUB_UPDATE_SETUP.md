@@ -5,40 +5,33 @@ Your application now has automatic update checking! When users launch the app, i
 
 ## Setup Steps
 
-### 1. Create GitHub Repository
+### 1. Confirm GitHub Repository
 
-1. Go to https://github.com/new
-2. Repository name: `BMagic-AutoVidCompiler` (or your preferred name)
-3. Choose **Public** or **Private** (both work, but public is easier)
-4. Don't initialize with README (we'll push existing code)
-5. Click "Create repository"
+Current release repository:
+
+`https://github.com/Knight-Logics/Auto-Video-Editor-and-Compiler`
 
 ### 2. Update Repository Name in Code
 
 Open `UOVidCompiler_GUI.py` and change line ~41:
 ```python
-GITHUB_REPO = "Nicholasjknight/Auto-Video-Editor-and-Compiler"
+GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"
 ```
-Replace `YourGitHubUsername` with your actual GitHub username.
+This must match the repository where release assets are published.
 
-### 3. Push Code to GitHub from VS Code
+### 3. Push Code to GitHub
 
 ```powershell
-# Initialize git (only once)
-cd "C:\Users\nknig\Downloads\BMagic_AutoVidCompiler_v1.1_Backup"
-git init
+cd "E:\Auto Video Compiler"
 
 # Add all files
 git add .
 
 # Commit
-git commit -m "Initial commit - BMagic Auto Vid Compiler v1.1.0"
-
-# Connect to GitHub repo (replace USERNAME)
-git remote add origin https://github.com/USERNAME/BMagic-AutoVidCompiler.git
+git commit -m "Release v1.2.1"
 
 # Push to GitHub
-git push -u origin main
+git push origin main
 ```
 
 If it asks for credentials, use a **Personal Access Token** (not password):
@@ -46,36 +39,29 @@ If it asks for credentials, use a **Personal Access Token** (not password):
 - Generate new token with `repo` scope
 - Use this token as your password
 
-### 4. Create Your First Release
+### 4. Create A Release
 
 #### From VS Code Terminal:
 ```powershell
 # Tag the current version
-git tag -a v1.1.0 -m "Release v1.1.0 - Initial public release with auto-update"
-git push origin v1.1.0
+git tag -a v1.2.1 -m "Release v1.2.1"
+git push origin v1.2.1
 ```
 
 #### On GitHub Website:
 1. Go to your repo → "Releases" tab
 2. Click "Create a new release"
-3. Tag: `v1.1.0` (should show as existing tag)
-4. Title: `v1.1.0 - Initial Release`
+3. Tag: `v1.2.1` (should show as existing tag)
+4. Title: `v1.2.1 - Stable Release`
 5. Description (changelog):
    ```
-   ## Features
-   - Smart overlap detection for retroactive recording
-   - Auto-resolution detection
-   - Music and intro support
-   - GUI configuration
-   - Automatic updates
-   
-   ## Bug Fixes
-   - Fixed trim duration selector
-   - Audio format validation and conversion
+   ## Fixes
+   - Auto-update checks now point at the Knight Logics release repo
+   - Selecting no trim no longer crashes direct compilation
+   - Auto Clipper tab imports cleanly
    ```
 6. **Attach the executable file**: Click "Attach binaries" and upload:
-   - `BMagic_AutoVidCompiler_TrimFix_20251114_225447.exe`
-   - Rename it to: `BMagic_AutoVidCompiler.exe` (simpler name)
+   - `dist\BMagic_AutoVidCompiler_PERFECT.exe`
 7. Click "Publish release"
 
 ### 5. For Future Updates
@@ -84,25 +70,25 @@ When you make changes and want to push an update:
 
 ```powershell
 # 1. Update VERSION in UOVidCompiler_GUI.py
-# Change: VERSION = "1.1.0" to VERSION = "1.1.1" (or 1.2.0, etc.)
+# Example: VERSION = "1.2.1" to VERSION = "1.2.2"
 
 # 2. Rebuild executable
 python -m PyInstaller BMagic_AutoVidCompiler_PERFECT.spec --clean --noconfirm
 
 # 3. Commit changes
 git add .
-git commit -m "Update to v1.1.1 - Fixed XYZ issue"
+git commit -m "Release v1.2.2 - Fixed XYZ issue"
 
 # 4. Create tag
-git tag -a v1.1.1 -m "Release v1.1.1"
+git tag -a v1.2.2 -m "Release v1.2.2"
 
 # 5. Push code and tag
 git push
-git push origin v1.1.1
+git push origin v1.2.2
 
 # 6. Create GitHub Release
 # - Go to GitHub → Releases → "Draft a new release"
-# - Select tag: v1.1.1
+# - Select tag: v1.2.2
 # - Add changelog
 # - Upload new .exe file
 # - Publish
@@ -131,10 +117,10 @@ Examples:
 
 ## Testing Auto-Update
 
-1. Build and release v1.1.0
-2. Change VERSION to "1.1.1" in code
-3. Build and release v1.1.1
-4. Run the v1.1.0 executable
+1. Build and release v1.2.1
+2. Change VERSION to "1.2.2" in code
+3. Build and release v1.2.2
+4. Run the v1.2.1 executable
 5. Should see update prompt automatically!
 
 ## Troubleshooting
@@ -155,7 +141,7 @@ Examples:
 ## Distribution
 
 Just share the GitHub Releases page URL:
-`https://github.com/Nicholasjknight/Auto-Video-Editor-and-Compiler/releases/latest`
+`https://github.com/Knight-Logics/Auto-Video-Editor-and-Compiler/releases/latest`
 
 Users download the .exe once, then auto-updates forever!
 
@@ -163,6 +149,6 @@ Users download the .exe once, then auto-updates forever!
 
 - Always test new version yourself before releasing
 - Write clear changelogs so users know what changed
-- Keep exe filename consistent: `BMagic_AutoVidCompiler.exe`
+- Keep exe filename consistent: `BMagic_AutoVidCompiler_PERFECT.exe`
 - Can delete old releases to save space (keep last 3-5)
-- Tag format must match: `v1.1.0` (with 'v' prefix)
+- Tag format must match: `v1.2.1` (with 'v' prefix)

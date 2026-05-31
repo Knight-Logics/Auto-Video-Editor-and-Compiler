@@ -743,11 +743,12 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 
                 # Update CONFIG dictionary
                 if hasattr(UOVidCompiler, 'CONFIG'):
-                    trim_value = int(self.trim_seconds_var.get())
+                    trim_selection = self.trim_seconds_var.get()
+                    trim_value = None if trim_selection == 'None' else int(trim_selection)
                     UOVidCompiler.CONFIG['intro_selection'] = self.intro_selection_var.get()
                     UOVidCompiler.CONFIG['music_selection'] = self.music_selection_var.get()
                     UOVidCompiler.CONFIG['trim_seconds'] = trim_value
-                    UOVidCompiler.CONFIG['clip_duration'] = float(trim_value)
+                    UOVidCompiler.CONFIG['clip_duration'] = float(trim_value) if trim_value is not None else 999999.0
                     UOVidCompiler.CONFIG['video_folder'] = self.input_path_var.get()
                     UOVidCompiler.CONFIG['output_folder'] = self.output_path_var.get()
                     self.log_status("[OK] CONFIG dictionary updated")
