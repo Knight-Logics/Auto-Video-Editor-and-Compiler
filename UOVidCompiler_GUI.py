@@ -21,11 +21,14 @@ import subprocess
 import sys
 import webbrowser
 import urllib.parse
+from types import ModuleType
 from PIL import Image, ImageTk
 import threading
 import urllib.request
 import tempfile
 import shutil
+import time
+import hashlib
 try:
     import qrcode
     from qrcode.constants import ERROR_CORRECT_L
@@ -40,10 +43,32 @@ try:
 except ImportError:
     DIRECT_COMPILATION = False
 
+try:
+    import autovid_license
+except ImportError:
+    autovid_license = None
+
+
+def get_autovid_license() -> ModuleType:
+    if autovid_license is None:
+        raise RuntimeError("License module is unavailable")
+    return autovid_license
+
 class UOVidCompilerGUI:
     # Version info for auto-updates
-    VERSION = "1.2.1"  # Update this when releasing new versions
+    VERSION = "1.3.0"  # Update this when releasing new versions
     GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"  # GitHub repo for auto-updates
+    VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v')
+    INTRO_EXTENSIONS = VIDEO_EXTENSIONS + ('.gif',)
+    MUSIC_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac')
+    CLIP_ORDER_OPTIONS = ('newest_first', 'oldest_first', 'filename_az', 'filename_za', 'custom')
+    CLIP_TIMEFRAME_OPTIONS = (
+        ('1 day', '1_day'),
+        ('1 week', '1_week'),
+        ('2 weeks', '2_weeks'),
+        ('Month', '1_month'),
+        ('All', 'all'),
+    )
     
     # Donation addresses
     DONATION_INFO = {
@@ -58,7 +83,9 @@ class UOVidCompilerGUI:
         self.root = tk.Tk()
         
         # Initialize critical variables first
-        self.config_file = os.path.join(os.path.dirname(__file__), "gui_config.json")
+        self.bundle_dir = self.get_bundle_dir()
+        self.storage_dir = self.get_storage_dir()
+        self.config_file = os.path.join(self.storage_dir, "gui_config.json")
         self.config = self.load_config()
         
         # Initialize logo state variables
@@ -76,12 +103,41 @@ class UOVidCompilerGUI:
         self.last_music_files = set()
         self.last_intro_files = set()
         self.monitoring_active = False
+        self.checkout_session_id = ""
+        self.checkout_window = None
+        self.license_recovery_window = None
+        self.license_status_var = tk.StringVar(value="License status loading...")
+        self.config_summary_var = tk.StringVar(value="")
+        self.custom_order_file = os.path.join(self.storage_dir, "custom_clip_order.json")
+        self.preview_process = None
+        self.stop_requested = False
+        self.license_use_consumed_for_run = False
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_text_var = tk.StringVar(value="Idle")
+        self.status_text = None
+        self.config_summary_label = None
+        self.clip_selection_files = []
+        self.clip_selection_summary_var = tk.StringVar(value="Select an input folder to load clips.")
+        self.clip_trim_overrides = {}
+        self.clip_selection_canvas = None
+        self.clip_selected_index = 0
+        self.clip_drag_index = None
+        self.clip_drag_changed = False
+        self.clip_row_height = 168
+        self.clip_cards_per_row = 2
+        self.clip_card_regions = []
+        self.clip_thumbnail_cache = {}
+        self.clip_trim_inputs = {}
+        self.clip_preview_window = None
+        self.clip_preview_thumb = None
         
         # Set icon IMMEDIATELY for taskbar
         self.set_taskbar_icon()
         
         # Load PNG logo for GUI use BEFORE creating widgets
         self.load_png_logo()
+
+        self.seed_media_folders()
         
         # Load payment method logos
         self.load_payment_logos()
@@ -90,8 +146,8 @@ class UOVidCompilerGUI:
         self.load_button_icons()
         
         self.root.title("Auto Video Editor & Compiler - Control Panel")
-        self.root.geometry("950x800")  # Slightly larger for better header visibility
-        self.root.minsize(900, 750)    # Larger minimum size to prevent layout issues
+        self.root.geometry("1280x960")
+        self.root.minsize(1100, 820)
         self.root.resizable(True, True)
         
         # Set application icon (additional setup)
@@ -110,11 +166,73 @@ class UOVidCompilerGUI:
         
         # Check for updates on startup (in background thread)
         threading.Thread(target=self.check_for_updates, daemon=True).start()
+        threading.Thread(target=self.refresh_license_status, daemon=True).start()
+
+    def get_bundle_dir(self):
+        """Return the bundled resource directory."""
+        return getattr(sys, '_MEIPASS', os.path.dirname(__file__))
+
+    def get_storage_dir(self):
+        """Return persistent writable app storage."""
+        if getattr(sys, 'frozen', False):
+            root = os.environ.get("APPDATA") or os.environ.get("PROGRAMDATA") or os.path.expanduser("~")
+            path = os.path.join(root, "KnightLogics", "AutoVidCompiler")
+        else:
+            path = os.path.dirname(__file__)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def get_music_dir(self):
+        return os.path.join(self.storage_dir, "Music")
+
+    def get_intro_dir(self):
+        return os.path.join(self.storage_dir, "Intros")
+
+    def get_thumbnail_dir(self):
+        path = os.path.join(self.storage_dir, "thumbnail-cache")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def get_icon_path(self):
+        return os.path.join(self.bundle_dir, "icons", "AutoVideoCompiler_icon.ico")
+
+    def get_ffmpeg_path(self):
+        candidates = [
+            os.path.join(self.bundle_dir, "ffmpeg", "ffmpeg.exe"),
+            shutil.which("ffmpeg"),
+        ]
+        return next((path for path in candidates if path and os.path.exists(path)), "")
+
+    def get_ffplay_path(self):
+        candidates = [
+            os.path.join(self.bundle_dir, "ffmpeg", "ffplay.exe"),
+            shutil.which("ffplay"),
+        ]
+        return next((path for path in candidates if path and os.path.exists(path)), "")
+
+    def seed_media_folders(self):
+        """Copy bundled starter media into persistent folders without overwriting user files."""
+        for folder_name, extensions in (("Music", self.MUSIC_EXTENSIONS), ("Intros", self.INTRO_EXTENSIONS)):
+            target_dir = os.path.join(self.storage_dir, folder_name)
+            source_dir = os.path.join(self.bundle_dir, folder_name)
+            os.makedirs(target_dir, exist_ok=True)
+            if not os.path.isdir(source_dir) or os.path.abspath(source_dir) == os.path.abspath(target_dir):
+                continue
+            for name in os.listdir(source_dir):
+                if not name.lower().endswith(extensions):
+                    continue
+                src = os.path.join(source_dir, name)
+                dst = os.path.join(target_dir, name)
+                if os.path.isfile(src) and not os.path.exists(dst):
+                    try:
+                        shutil.copy2(src, dst)
+                    except Exception as e:
+                        print(f"Could not seed media file {name}: {e}")
         
     def set_taskbar_icon(self):
         """Set taskbar icon immediately upon window creation - CRITICAL for Windows taskbar display"""
         try:
-            ico_path = os.path.join(os.path.dirname(__file__), "icons", "image.ico")
+            ico_path = self.get_icon_path()
             if os.path.exists(ico_path):
                 # IMMEDIATE icon setting before window appears
                 self.root.iconbitmap(ico_path)
@@ -123,7 +241,7 @@ class UOVidCompilerGUI:
                 try:
                     import ctypes
                     # Set the application model ID to distinguish from Python
-                    app_id = 'BMagic.UOVidCompiler.GUI.1.0'
+                    app_id = 'KnightLogics.AutoVidCompiler.GUI.1.3'
                     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
                     print(f"Set Windows App ID: {app_id}")
                 except Exception as e:
@@ -151,17 +269,18 @@ class UOVidCompilerGUI:
         self.trim_seconds_var = tk.StringVar()
         self.music_selection_var = tk.StringVar()
         self.intro_selection_var = tk.StringVar()
+        self.clip_order_var = tk.StringVar(value="newest_first")
+        self.clip_timeframe_var = tk.StringVar(value="1_week")
         # Removed resolution_var - using auto-detection always
 
     def load_png_logo(self):
         """Load PNG logo for GUI display - called early in initialization"""
         try:
-            logo_path = os.path.join(os.path.dirname(__file__), "icons", "KnightLogicsVidCompiler_transparent.png")
+            logo_path = os.path.join(self.bundle_dir, "icons", "AutoVideoCompiler_header_ui.png")
             
             if os.path.exists(logo_path):
-                # Load and resize logo for display in GUI (150x150 pixels)
                 logo_image = Image.open(logo_path)
-                self.logo_large = logo_image.resize((150, 150), Image.Resampling.LANCZOS)
+                self.logo_large = logo_image.copy()
                 self.logo_large_tk = ImageTk.PhotoImage(self.logo_large)
                 
                 # Create small version for any internal use
@@ -195,7 +314,7 @@ class UOVidCompilerGUI:
         for payment in payment_methods:
             try:
                 # Try to load button icon (24x24) for buttons
-                button_icon_path = os.path.join(os.path.dirname(__file__), "icons", f"{payment}_button_icon.png")
+                button_icon_path = os.path.join(self.bundle_dir, "icons", f"{payment}_button_icon.png")
                 
                 if os.path.exists(button_icon_path):
                     img = Image.open(button_icon_path)
@@ -218,7 +337,7 @@ class UOVidCompilerGUI:
         """Setup application icon from ICO file for proper Windows taskbar integration"""
         try:
             # Only handle ICO file for taskbar (PNG already loaded separately)
-            ico_path = os.path.join(os.path.dirname(__file__), "icons", "image.ico")
+            ico_path = self.get_icon_path()
             
             # Set ICO file for taskbar (primary method for Windows)
             if os.path.exists(ico_path):
@@ -339,7 +458,7 @@ class UOVidCompilerGUI:
         
         # Main container with padding and styling
         main_frame = ttk.Frame(self.root, style='Custom.TFrame')
-        main_frame.pack(fill='both', expand=True, padx=15, pady=15)
+        main_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         # Header with logo and title
         self.create_header(main_frame)
@@ -350,22 +469,19 @@ class UOVidCompilerGUI:
         # Action buttons
         self.create_action_section(main_frame)
         
-        # Status area
-        self.create_status_section(main_frame)
-        
     def create_header(self, parent):
         """Create professional header with logo, title, and support section"""
         # Main header frame with fixed height
         header_frame = ttk.Frame(parent, style='Header.TFrame')
-        header_frame.pack(fill='x', pady=(0, 20), padx=10)
+        header_frame.pack(fill='x', pady=(0, 10), padx=6)
         
         # Configure header frame to maintain consistent height
         header_frame.pack_propagate(False)
-        header_frame.configure(height=140)
+        header_frame.configure(height=118)
         
         # Left side: Logo container (centered vertically)
         logo_frame = ttk.Frame(header_frame, style='Header.TFrame')
-        logo_frame.pack(side='left', padx=(0, 20), anchor='center')
+        logo_frame.pack(side='left', padx=(0, 14), anchor='center')
         
         # Logo (if available) - with error handling
         logo_displayed = False
@@ -384,105 +500,201 @@ class UOVidCompilerGUI:
                                     background=self.colors['bg'], foreground=self.colors['accent'])
             fallback_logo.pack()
             print("[PACKAGE] Using fallback text logo")
-        
-        # Center: Title section - vertically centered
+
+        ttk.Label(
+            logo_frame,
+            text="Professional video compilation tool v" + str(self.VERSION),
+            style='Heading.TLabel',
+            font=('Segoe UI', 9)
+        ).pack(anchor='center', pady=(2, 0))
+
+        # Center: Demo placeholder section
         title_frame = ttk.Frame(header_frame, style='Header.TFrame')
-        title_frame.pack(side='left', fill='both', expand=True, padx=(0, 20))
+        title_frame.pack(side='left', fill='both', expand=True, padx=(0, 12))
         
         # Create inner frame for vertical centering
         title_inner = ttk.Frame(title_frame, style='Header.TFrame')
         title_inner.pack(anchor='center', expand=True)
         
-        # Title
-        title_label = ttk.Label(title_inner, text="Auto Video Editor & Compiler", 
-                              style='Title.TLabel', font=('Segoe UI', 18, 'bold'))
-        title_label.pack(anchor='w')
-        
-        # Subtitle and version on same line
-        info_frame = ttk.Frame(title_inner, style='Header.TFrame')
-        info_frame.pack(anchor='w', pady=(3, 0))
-        
-        subtitle_label = ttk.Label(info_frame, 
-                                 text="Professional video compilation tool  •  v" + str(self.VERSION),
-                                 style='Heading.TLabel', font=('Segoe UI', 9))
-        subtitle_label.pack(anchor='w')
-        
-        # Right side: Support section - vertically centered
-        support_frame = ttk.Frame(header_frame, style='Header.TFrame')
-        support_frame.pack(side='right', anchor='center', padx=(0, 5))
-        
-        # Support header
-        support_label = ttk.Label(support_frame, text="❤ Support Development", 
-                                style='Heading.TLabel', font=('Segoe UI', 10, 'bold'))
-        support_label.pack()
-        
-        # Payment buttons frame
-        buttons_frame = ttk.Frame(support_frame, style='Header.TFrame')
-        buttons_frame.pack(pady=(5, 0))
-        
-        # Payment method configurations - now with logo support
+        ttk.Label(
+            title_inner,
+            text="Demo video placeholder",
+            style='Heading.TLabel',
+            font=('Segoe UI', 10, 'bold')
+        ).pack(anchor='w')
+
+        tk.Button(
+            title_inner,
+            text="Watch Demo",
+            command=self.open_demo_video,
+            font=('Segoe UI', 8, 'bold'),
+            bg=self.colors['button'],
+            fg='white',
+            relief='raised',
+            padx=10,
+            pady=4,
+            cursor='hand2',
+        ).pack(anchor='w', pady=(4, 0))
+
+        # Right side: licensing and attribution
+        license_frame = ttk.Frame(header_frame, style='Header.TFrame')
+        license_frame.pack(side='right', anchor='n', padx=(0, 5), pady=(4, 0))
+
+        ttk.Label(
+            license_frame,
+            textvariable=self.license_status_var,
+            style='Heading.TLabel',
+            font=('Segoe UI', 9, 'bold'),
+            justify='right',
+        ).pack(anchor='e')
+
+        license_buttons = ttk.Frame(license_frame, style='Header.TFrame')
+        license_buttons.pack(anchor='e', pady=(4, 0))
+
+        tk.Button(
+            license_buttons,
+            text="Plans",
+            command=self.show_checkout_window,
+            font=('Segoe UI', 8, 'bold'),
+            bg=self.colors['accent'],
+            fg='white',
+            relief='raised',
+            padx=8,
+            pady=3,
+            cursor='hand2',
+        ).pack(side='left', padx=(0, 6))
+
+        tk.Button(
+            license_buttons,
+            text="Restore",
+            command=self.show_license_recovery_window,
+            font=('Segoe UI', 8),
+            bg=self.colors['button'],
+            fg='white',
+            relief='raised',
+            padx=8,
+            pady=3,
+            cursor='hand2',
+        ).pack(side='left', padx=(0, 6))
+
+        tk.Button(
+            license_buttons,
+            text="Refresh",
+            command=lambda: threading.Thread(target=self.refresh_license_status, daemon=True).start(),
+            font=('Segoe UI', 8),
+            bg=self.colors['button'],
+            fg='white',
+            relief='raised',
+            padx=8,
+            pady=3,
+            cursor='hand2',
+        ).pack(side='left')
+
+        ttk.Label(
+            license_frame,
+            text="20 free compiles, then packs or monthly access",
+            style='Heading.TLabel',
+            font=('Segoe UI', 8),
+            justify='right',
+        ).pack(anchor='e', pady=(3, 0))
+        return
+
+    def create_donation_support_section(self, parent):
+        """Create a separate optional-donation area away from the licensing header."""
+        support_frame = tk.Frame(parent, bg=self.colors['frame_bg'])
+        support_frame.pack(fill='x', pady=(8, 0))
+
+        message_frame = tk.Frame(support_frame, bg=self.colors['frame_bg'])
+        message_frame.pack(side='left', fill='x', expand=True)
+
+        tk.Label(
+            message_frame,
+            text="Optional donations",
+            bg=self.colors['frame_bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 9, 'bold'),
+            anchor='w',
+        ).pack(anchor='w')
+
+        tk.Label(
+            message_frame,
+            text="Donations are just extra support for development. They do not add credits or unlock packs/monthly access.",
+            bg=self.colors['frame_bg'],
+            fg='#c6d0dc',
+            font=('Segoe UI', 8),
+            anchor='w',
+            justify='left',
+            wraplength=720,
+        ).pack(anchor='w', pady=(2, 0))
+
+        icon_row = tk.Frame(support_frame, bg=self.colors['frame_bg'])
+        icon_row.pack(side='right', anchor='n', padx=(12, 0))
+
         payment_methods = [
-            ('Venmo', 'venmo', self.colors['button'], lambda: self.open_venmo()),
-            ('PayPal', 'paypal', '#0070ba', lambda: self.open_paypal()),
-            ('Bitcoin', 'bitcoin', '#f7931a', lambda: self.copy_crypto_address('btc')),
-            ('Ethereum', 'ethereum', '#627eea', lambda: self.copy_crypto_address('eth')),
-            ('Solana', 'solana', '#14f195', lambda: self.copy_crypto_address('sol'))
+            ('Venmo', 'venmo', lambda: self.open_venmo()),
+            ('PayPal', 'paypal', lambda: self.open_paypal()),
+            ('Bitcoin', 'bitcoin', lambda: self.copy_crypto_address('btc')),
+            ('Ethereum', 'ethereum', lambda: self.copy_crypto_address('eth')),
+            ('Solana', 'solana', lambda: self.copy_crypto_address('sol')),
         ]
-        
-        # Create payment buttons with logos
-        for i, (name, logo_key, color, command) in enumerate(payment_methods):
-            # Check if we have a logo for this payment method
+
+        for name, logo_key, command in payment_methods:
             if hasattr(self, 'payment_logos') and logo_key in self.payment_logos:
-                # Use actual logo image with transparent button background
-                btn = tk.Button(buttons_frame, 
-                              image=self.payment_logos[logo_key],
-                              bg=self.colors['bg'],  # Match header background
-                              fg='white',
-                              width=36,
-                              height=36,
-                              relief='flat',  # Flat relief for minimal button appearance
-                              borderwidth=0,  # No border
-                              cursor='hand2',
-                              command=command,
-                              activebackground=self.colors['bg'])  # Keep same bg when clicked
-                
-                # Add tooltip with payment method name
-                self.create_tooltip(btn, f"Donate via {name}")
-                print(f"[OK] Created {name} button with official logo")
+                btn = tk.Button(
+                    icon_row,
+                    image=self.payment_logos[logo_key],
+                    bg=self.colors['frame_bg'],
+                    fg='white',
+                    width=28,
+                    height=28,
+                    relief='flat',
+                    borderwidth=0,
+                    cursor='hand2',
+                    command=command,
+                    activebackground=self.colors['frame_bg'],
+                )
+                print(f"[OK] Created {name} donation button with official logo")
             else:
-                # Fallback to text/emoji if logo not available - also with transparent background
                 fallback_icons = {
-                    'venmo': 'V', 'paypal': 'P', 'bitcoin': 'B', 
+                    'venmo': 'V', 'paypal': 'P', 'bitcoin': 'B',
                     'ethereum': 'E', 'solana': 'S'
                 }
-                
-                btn = tk.Button(buttons_frame, 
-                              text=fallback_icons.get(logo_key, 'P'),
-                              font=('Segoe UI', 12, 'bold'),
-                              bg=self.colors['bg'],  # Match header background
-                              fg='white',
-                              width=3,
-                              height=1,
-                              relief='flat',  # Flat relief for minimal appearance
-                              borderwidth=0,  # No border
-                              cursor='hand2',
-                              command=command,
-                              activebackground=self.colors['bg'])  # Keep same bg when clicked
-                
-                print(f"[WARN] Using fallback icon for {name} (logo not available)")
-            btn.pack(side='left', padx=2)
-            
-            # Add tooltip
-            self.create_tooltip(btn, f"{name}: Click to {('open' if name in ['Venmo', 'PayPal'] else 'copy address')}")
-        
+                btn = tk.Button(
+                    icon_row,
+                    text=fallback_icons.get(logo_key, 'P'),
+                    font=('Segoe UI', 10, 'bold'),
+                    bg=self.colors['frame_bg'],
+                    fg='white',
+                    width=2,
+                    height=1,
+                    relief='flat',
+                    borderwidth=0,
+                    cursor='hand2',
+                    command=command,
+                    activebackground=self.colors['frame_bg'],
+                )
+                print(f"[WARN] Using fallback icon for {name} donation button")
+
+            btn.pack(side='left', padx=(0, 4))
+            self.create_tooltip(btn, f"Optional donation via {name}. This does not add credits.")
 
         
     def create_config_section(self, parent):
         """Create configuration input section"""
         
         # Configuration frame with standard styling
-        config_frame = ttk.LabelFrame(parent, text="Path Configuration", padding=20)
-        config_frame.pack(fill='x', pady=(0, 20))
+        config_frame = tk.LabelFrame(
+            parent,
+            text="Path Configuration",
+            padx=12,
+            pady=10,
+            bg=self.colors['frame_bg'],
+            fg=self.colors['title_color'],
+            font=('Segoe UI', 11, 'bold'),
+            relief='groove',
+            borderwidth=2,
+        )
+        config_frame.pack(fill='x', pady=(0, 10))
         
         # Input folder
         self.create_path_row(config_frame, "Input Video Folder:", "input_path", 
@@ -490,9 +702,10 @@ class UOVidCompilerGUI:
                            is_directory=True, row=0)
         
         # Output folder  
-        self.create_path_row(config_frame, "[OUTPUT] Output Video Folder:", "output_path",
+        self.create_path_row(config_frame, "Output Video Folder:", "output_path",
                            "Select folder where compiled videos will be saved", 
                            is_directory=True, row=1)
+        return
         
         # Current paths display with enhanced styling
         current_frame = ttk.Frame(config_frame, style='Custom.TFrame')
@@ -514,15 +727,21 @@ class UOVidCompilerGUI:
         """Create a path selection row"""
         
         # Label
-        label = ttk.Label(parent, text=label_text, style='Info.TLabel')
-        label.grid(row=row, column=0, sticky='w', padx=(0, 10), pady=5)
+        label = tk.Label(
+            parent,
+            text=label_text,
+            bg=self.colors['frame_bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 10, 'bold'),
+        )
+        label.grid(row=row, column=0, sticky='w', padx=(0, 10), pady=3)
         
         # Entry with enhanced styling
         entry_var = tk.StringVar()
         setattr(self, f"{config_key}_var", entry_var)
         
         entry = ttk.Entry(parent, textvariable=entry_var, width=55, style='Custom.TEntry')
-        entry.grid(row=row, column=1, sticky='ew', padx=(0, 15), pady=8)
+        entry.grid(row=row, column=1, sticky='ew', padx=(0, 12), pady=4)
         
         # Browse button with enhanced styling and icon
         browse_cmd = lambda: self.browse_path(entry_var, is_directory, tooltip)
@@ -532,14 +751,14 @@ class UOVidCompilerGUI:
                               image=self.icons['folder'],
                               compound='left',
                               command=browse_cmd, 
-                              font=('Arial', 9),
+                              font=('Arial', 8),
                               bg=self.colors['button'],
                               fg='white',
                               relief='raised',
                               width=80,  # Pixel width instead of character width
-                              padx=8)
+                              padx=6)
         self.button_images[f'browse_{config_key}'] = self.icons['folder']  # Keep reference to prevent garbage collection
-        browse_btn.grid(row=row, column=2, pady=8)
+        browse_btn.grid(row=row, column=2, pady=4)
         
         # Configure grid weights
         parent.grid_columnconfigure(1, weight=1)
@@ -555,27 +774,29 @@ class UOVidCompilerGUI:
             var.set(path)
             self.update_paths_display()
             self.save_config()
+            if var is getattr(self, 'input_path_var', None):
+                self.refresh_clip_selection_panel(preserve_saved=True)
     
     def get_available_music(self):
         """Get list of available music files"""
         try:
-            music_dir = os.path.join(os.path.dirname(__file__), "Music")
+            music_dir = self.get_music_dir()
             if not os.path.exists(music_dir):
                 return ['None', '[RANDOM] Random']
             
             music_files = ['None', '[RANDOM] Random']  # None option first, then random option
             for file in os.listdir(music_dir):
-                if file.lower().endswith(('.mp3', '.wav', '.m4a', '.flac')):
+                if file.lower().endswith(self.MUSIC_EXTENSIONS):
                     music_files.append(os.path.splitext(file)[0])  # Remove extension for display
             
             return music_files if len(music_files) > 2 else ['None', '[RANDOM] Random']
         except Exception:
-            return ['[RANDOM] Random']
+            return ['None', '[RANDOM] Random']
     
     def get_available_intros(self):
         """Get list of available intro video files"""
         try:
-            intro_dir = os.path.join(os.path.dirname(__file__), "Intros")
+            intro_dir = self.get_intro_dir()
             if not os.path.exists(intro_dir):
                 return ['StockDefault']
             
@@ -583,7 +804,7 @@ class UOVidCompilerGUI:
             stock_default_found = False
             
             for file in os.listdir(intro_dir):
-                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                if file.lower().endswith(self.INTRO_EXTENSIONS):
                     filename = os.path.splitext(file)[0]  # Remove extension for display
                     if filename == 'StockDefault':
                         stock_default_found = True
@@ -597,74 +818,123 @@ class UOVidCompilerGUI:
             result.append('[RANDOM] Random')
             result.extend(sorted(intro_files))
             
-            return result if result else ['None', 'StockDefault']
+            return result if result else ['None', '[RANDOM] Random']
         except Exception:
-            return ['StockDefault']
+            return ['None', '[RANDOM] Random']
     
     def create_action_section(self, parent):
         """Create action buttons section with video configuration options"""
         
         # Action buttons with enhanced layout
         action_frame = ttk.Frame(parent, style='Custom.TFrame')
-        action_frame.pack(fill='x', pady=(0, 20))
+        action_frame.pack(fill='both', expand=True, pady=(0, 10))
         
         # Video Configuration Options (above the main button)
         config_options_frame = ttk.Frame(action_frame, style='Custom.TFrame')
-        config_options_frame.pack(fill='x', pady=(0, 20))
+        config_options_frame.pack(fill='x', pady=(0, 8))
         
-        # Create a grid layout for the 3 options with proper spacing
+        # Create a grid layout for the options with proper spacing
         options_container = ttk.Frame(config_options_frame, style='Custom.TFrame')
-        options_container.pack(fill='x', pady=(0, 10))
+        options_container.pack(fill='x', pady=(0, 4))
         
         # Configure grid weights to make columns expand evenly
         options_container.grid_columnconfigure(0, weight=1)
         options_container.grid_columnconfigure(1, weight=1)
         options_container.grid_columnconfigure(2, weight=1)
-        
-        # Option 1: Trim seconds (left column)
-        trim_frame = ttk.Frame(options_container, style='Custom.TFrame')
-        trim_frame.grid(row=0, column=0, sticky='ew', padx=(0, 10))
-        
-        ttk.Label(trim_frame, text="Seconds Trimmed from End:", style='Info.TLabel').pack(anchor='w')
+
+        ttk.Label(options_container, text="Seconds Trimmed from End:", style='Info.TLabel').grid(row=0, column=0, sticky='w', padx=5)
+        ttk.Label(options_container, text="Background Music:", style='Info.TLabel').grid(row=0, column=1, sticky='w', padx=5)
+        ttk.Label(options_container, text="Intro:", style='Info.TLabel').grid(row=0, column=2, sticky='w', padx=5)
+
         trim_options = ['None', '5', '10', '15', '20', '25', '30']
         self.trim_seconds_var.set('15')  # Default to 15 seconds like S+ working version
-        trim_combo = ttk.Combobox(trim_frame, textvariable=self.trim_seconds_var, 
+        trim_combo = ttk.Combobox(options_container, textvariable=self.trim_seconds_var,
                                 values=trim_options, state='readonly')
-        trim_combo.pack(fill='x', pady=(2, 0))
+        trim_combo.grid(row=1, column=0, sticky='ew', padx=5, pady=(2, 0))
+        trim_combo.bind('<<ComboboxSelected>>', self.on_trim_seconds_changed)
         
-        # Option 2: Background Music (center column)
-        music_frame = ttk.Frame(options_container, style='Custom.TFrame')
-        music_frame.grid(row=0, column=1, sticky='ew', padx=5)
-
-        ttk.Label(music_frame, text="Background Music:", style='Info.TLabel').pack(anchor='w')
         music_options = self.get_available_music()
         # Set default to None if empty
         if not self.music_selection_var.get() and music_options:
             self.music_selection_var.set(music_options[0])  # 'None'
-        self.music_combo = ttk.Combobox(music_frame, textvariable=self.music_selection_var,
+        self.music_combo = ttk.Combobox(options_container, textvariable=self.music_selection_var,
                                  values=music_options, state='readonly')
-        self.music_combo.pack(fill='x', pady=(2, 0))
+        self.music_combo.grid(row=1, column=1, sticky='ew', padx=5, pady=(2, 0))
         # Ensure current selection is visible
-        self.music_combo.current(0 if not self.music_selection_var.get() else self.music_combo['values'].index(self.music_selection_var.get()))
+        if self.music_selection_var.get() in music_options:
+            self.music_combo.current(music_options.index(self.music_selection_var.get()))
+        else:
+            self.music_combo.current(0)
+        self.music_combo.bind('<<ComboboxSelected>>', lambda _event: self.save_config())
+        music_tools = ttk.Frame(options_container, style='Custom.TFrame')
+        music_tools.grid(row=2, column=1, sticky='w', padx=5, pady=(3, 0))
+        tk.Button(
+            music_tools,
+            text="Add Music...",
+            command=self.add_music_files,
+            font=('Segoe UI', 8),
+            bg=self.colors['button'],
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=6,
+            pady=2,
+        ).pack(side='left')
+        music_link = tk.Label(
+            music_tools,
+            text="Open folder",
+            bg=self.colors['frame_bg'],
+            fg=self.colors['accent'],
+            cursor='hand2',
+            font=('Segoe UI', 8, 'underline'),
+        )
+        music_link.pack(side='left', padx=(8, 0))
+        music_link.bind('<Button-1>', lambda _event: self.open_music_folder())
 
-        # Option 3: Intro Video (right column)
-        intro_frame = ttk.Frame(options_container, style='Custom.TFrame')
-        intro_frame.grid(row=0, column=2, sticky='ew', padx=(10, 0))
-
-        ttk.Label(intro_frame, text="Intro:", style='Info.TLabel').pack(anchor='w')
         intro_options = self.get_available_intros()
         # Set default to None if empty
         if not self.intro_selection_var.get() and intro_options:
             self.intro_selection_var.set(intro_options[0])  # 'None'
-        self.intro_combo = ttk.Combobox(intro_frame, textvariable=self.intro_selection_var,
+        self.intro_combo = ttk.Combobox(options_container, textvariable=self.intro_selection_var,
                                  values=intro_options, state='readonly')
-        self.intro_combo.pack(fill='x', pady=(2, 0))
+        self.intro_combo.grid(row=1, column=2, sticky='ew', padx=5, pady=(2, 0))
         # Ensure current selection is visible
-        self.intro_combo.current(0 if not self.intro_selection_var.get() else self.intro_combo['values'].index(self.intro_selection_var.get()))
-        
-        # Main action button (prominent)
+        if self.intro_selection_var.get() in intro_options:
+            self.intro_combo.current(intro_options.index(self.intro_selection_var.get()))
+        else:
+            self.intro_combo.current(0)
+        self.intro_combo.bind('<<ComboboxSelected>>', lambda _event: self.save_config())
+        intro_tools = ttk.Frame(options_container, style='Custom.TFrame')
+        intro_tools.grid(row=2, column=2, sticky='w', padx=5, pady=(3, 0))
+        tk.Button(
+            intro_tools,
+            text="Add Intro/GIF...",
+            command=self.add_intro_files,
+            font=('Segoe UI', 8),
+            bg=self.colors['button'],
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=6,
+            pady=2,
+        ).pack(side='left')
+        intro_link = tk.Label(
+            intro_tools,
+            text="Open folder",
+            bg=self.colors['frame_bg'],
+            fg=self.colors['accent'],
+            cursor='hand2',
+            font=('Segoe UI', 8, 'underline'),
+        )
+        intro_link.pack(side='left', padx=(8, 0))
+        intro_link.bind('<Button-1>', lambda _event: self.open_intro_folder())
+
+        self.create_clip_selection_panel(action_frame)
+
+        # Main action button (prominent) with stop control
         main_button_frame = ttk.Frame(action_frame, style='Custom.TFrame')
-        main_button_frame.pack(fill='x', pady=(0, 15))
+        main_button_frame.pack(fill='x', pady=(0, 8))
+        main_button_frame.grid_columnconfigure(0, weight=1)
         
         self.run_btn = tk.Button(main_button_frame, 
                                text="RUN VIDEO COMPILER", 
@@ -676,51 +946,190 @@ class UOVidCompilerGUI:
                                borderwidth=3,
                                pady=15,
                                cursor='hand2')
-        self.run_btn.pack(fill='x')
-        
-        # Secondary buttons in a row
-        secondary_frame = ttk.Frame(action_frame, style='Custom.TFrame')
-        secondary_frame.pack(fill='x')
-        
-        # Remove font from ttk.Button style dict since ttk doesn't support it
-        btn_style = {'width': 18, 'style': 'Custom.TButton'}
-        
-        # Create action buttons with icons (removed problematic config and test buttons)
-        action_buttons = [
-            ("View Logs", self.view_logs, 'logs'),
-            ("Output Folder", self.open_output_folder, 'output'),
-            ("Intro Videos", self.open_intro_folder, 'video'),
-            ("Music Folder", self.open_music_folder, 'music')
-        ]
-        
-        for i, (text, command, icon_key) in enumerate(action_buttons):
-            btn = tk.Button(
-                secondary_frame, 
-                text=text,
-                image=self.icons[icon_key],
-                compound='left',
-                command=command,
-                font=('Arial', 9),
-                bg=self.colors['button'],
+        self.run_btn.grid(row=0, column=0, sticky='ew', padx=(0, 10))
+
+        self.stop_btn = tk.Button(
+            main_button_frame,
+            text="STOP",
+            command=self.request_stop,
+            bg=self.colors['error'],
+            fg='white',
+            font=('Segoe UI', 12, 'bold'),
+            relief='raised',
+            borderwidth=3,
+            padx=18,
+            pady=15,
+            cursor='hand2',
+            state='disabled',
+        )
+        self.stop_btn.grid(row=0, column=1, sticky='ns')
+        self.stop_btn.grid_remove()
+
+        progress_frame = ttk.Frame(action_frame, style='Custom.TFrame')
+        progress_frame.pack(fill='x')
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.progress_var,
+            maximum=100,
+            mode='determinate',
+        )
+        self.progress_bar.pack(fill='x')
+        tk.Label(
+            progress_frame,
+            textvariable=self.progress_text_var,
+            bg=self.colors['frame_bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 9),
+            anchor='w',
+        ).pack(fill='x', pady=(4, 0))
+
+        self.create_donation_support_section(action_frame)
+
+    def create_clip_selection_panel(self, parent):
+        """Create the always-visible clip selection and ordering panel."""
+        panel = tk.LabelFrame(
+            parent,
+            text="Clip Selection",
+            padx=10,
+            pady=8,
+            bg=self.colors['frame_bg'],
+            fg=self.colors['title_color'],
+            font=('Segoe UI', 11, 'bold'),
+            relief='groove',
+            borderwidth=2,
+        )
+        panel.pack(fill='both', expand=True, pady=(0, 10))
+        self.clip_selection_panel = panel
+
+        toolbar = tk.Frame(panel, bg=self.colors['frame_bg'])
+        toolbar.pack(fill='x')
+
+        tk.Label(
+            toolbar,
+            text="Timeframe:",
+            bg=self.colors['frame_bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 9, 'bold'),
+        ).pack(side='left', padx=(0, 8))
+
+        for label, value in self.CLIP_TIMEFRAME_OPTIONS:
+            bubble = tk.Radiobutton(
+                toolbar,
+                text=label,
+                value=value,
+                variable=self.clip_timeframe_var,
+                indicatoron=False,
+                command=self.on_clip_timeframe_changed,
+                bg='#2b3138',
                 fg='white',
-                relief='raised',
-                width=90,  # Pixel width
+                activebackground='#30574c',
+                activeforeground='white',
+                selectcolor=self.colors['accent'],
+                relief='ridge',
+                borderwidth=1,
                 padx=8,
-                pady=4
+                pady=3,
+                cursor='hand2',
+                font=('Segoe UI', 8, 'bold'),
             )
-            self.button_images[f'action_{icon_key}'] = self.icons[icon_key]  # Keep reference
-            
-            if i < 4:  # First 4 buttons on the left
-                btn.pack(side='left', padx=(0, 10))
-            else:  # Last 2 buttons on the right
-                btn.pack(side='right', padx=(10, 0))
+            bubble.pack(side='left', padx=(0, 6))
+
+        tk.Label(
+            toolbar,
+            text="Order:",
+            bg=self.colors['frame_bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 9, 'bold'),
+        ).pack(side='left', padx=(10, 6))
+
+        if self.clip_order_var.get() not in self.CLIP_ORDER_OPTIONS:
+            self.clip_order_var.set('newest_first')
+        self.clip_order_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.clip_order_var,
+            values=self.CLIP_ORDER_OPTIONS,
+            state='readonly',
+            width=15,
+        )
+        self.clip_order_combo.pack(side='left')
+        self.clip_order_combo.bind('<<ComboboxSelected>>', self.on_clip_order_changed)
+
+        summary_row = tk.Frame(panel, bg=self.colors['frame_bg'])
+        summary_row.pack(fill='x', pady=(4, 4))
+
+        tk.Label(
+            summary_row,
+            textvariable=self.clip_selection_summary_var,
+            bg=self.colors['frame_bg'],
+            fg=self.colors['accent'],
+            font=('Segoe UI', 9, 'bold'),
+            justify='left',
+        ).pack(side='left', anchor='w')
+
+        tk.Button(
+            toolbar,
+            text="Restore Filtered List",
+            command=lambda: self.refresh_clip_selection_panel(preserve_saved=False),
+            font=('Segoe UI', 8),
+            bg=self.colors['button'],
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=8,
+            pady=3,
+        ).pack(side='right')
+
+        tk.Button(
+            toolbar,
+            text="Save Selection",
+            command=lambda: self.persist_clip_selection_snapshot(log_message=True),
+            font=('Segoe UI', 8),
+            bg=self.colors['accent'],
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=8,
+            pady=3,
+        ).pack(side='right', padx=(0, 8))
+
+        body = tk.Frame(panel, bg=self.colors['frame_bg'])
+        body.pack(fill='both', expand=True)
+
+        self.clip_selection_canvas = tk.Canvas(body, bg="#1f252c", highlightthickness=0, cursor="hand2", height=360)
+        clip_scrollbar = ttk.Scrollbar(body, orient='vertical', command=self.clip_selection_canvas.yview)
+        self.clip_selection_canvas.configure(yscrollcommand=clip_scrollbar.set)
+        self.clip_selection_canvas.pack(side='left', fill='both', expand=True)
+        clip_scrollbar.pack(side='right', fill='y')
+
+        self.clip_selection_canvas.bind('<Configure>', lambda _event: self.draw_clip_selection_rows())
+        self.clip_selection_canvas.bind('<B1-Motion>', self.on_clip_drag_motion)
+        self.clip_selection_canvas.bind('<ButtonRelease-1>', self.on_clip_drag_end)
+        self.refresh_clip_selection_panel(preserve_saved=True, save_snapshot=False)
         
     def create_status_section(self, parent):
         """Create status display section with enhanced styling"""
+        self.status_text = None
+        self.config_summary_label = None
+        return
         
         # Status frame with standard styling
         status_frame = ttk.LabelFrame(parent, text="Status & Information", padding=15)
         status_frame.pack(fill='both', expand=True)
+
+        self.config_summary_label = tk.Label(
+            status_frame,
+            textvariable=self.config_summary_var,
+            bg=self.colors['text_bg'],
+            fg=self.colors['text_fg'],
+            font=('Consolas', 9),
+            anchor='w',
+            justify='left',
+            padx=8,
+            pady=8,
+            borderwidth=2,
+            relief='sunken',
+        )
+        self.config_summary_label.pack(fill='x', pady=(0, 10))
         
         # Status text area with dark theme
         self.status_text = tk.Text(status_frame, height=15, width=80, wrap='word',
@@ -740,7 +1149,7 @@ class UOVidCompilerGUI:
         self.status_text.configure(yscrollcommand=scrollbar.set)
         
         # Enhanced initial status messages - SAFE ASCII VERSION for standalone EXE
-        startup_text = """Welcome to Knight Logics Auto Video Editor & Compiler!
+        startup_text = """Welcome to Auto Vid Compiler!
 
 ********* INSTRUCTIONS *********
 
@@ -749,7 +1158,7 @@ Automatically combines multiple short clips into one polished video with intro a
 
 [PATHS] VIDEO INPUT PATH: Select folder containing your video clips
    * IMPORTANT: Will process ALL videos in this folder
-   * Only processes video files (MP4, AVI, MOV, MKV, etc.)
+   * Video formats: MP4, AVI, MOV, MKV, WEBM, M4V
    * Skips files larger than 500MB to prevent hanging
 
 [TIME] TRIM SECONDS: Duration to take from the END of each video
@@ -757,13 +1166,16 @@ Automatically combines multiple short clips into one polished video with intro a
    * All clips will be standardized to this same duration
 
 [MUSIC] MUSIC SELECTION: Background music for your compilation
-   * Choose from included royalty-free tracks
+   * Audio formats: MP3, WAV, M4A, OGG, FLAC, AAC
    * Music loops/extends to match total video length
    * Mixed at lower volume so original audio stays clear
 
 [INTRO] INTRO SELECTION: Optional intro video to start compilation
+   * Intro formats: MP4, AVI, MOV, MKV, WEBM, M4V, GIF
    * Adds professional touch to your final video
    * Intro duration matches your trim seconds setting
+
+[ORDER] CLIP ORDER: Choose newest-first, oldest-first, filename order, or save a custom order
 
 [RUN] COMPILE VIDEOS: Starts the compilation process
    * Creates: Intro + All Clips + Background Music = Final Video
@@ -790,42 +1202,1325 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         
     def update_paths_display(self):
         """Update the current paths display with enhanced formatting"""
-        self.paths_text.delete(1.0, tk.END)
-        
         input_path = self.input_path_var.get()
         output_path = self.output_path_var.get()
-        
-        # Enhanced display with status indicators
-        display_text = "[FOLDER] FOLDER CONFIGURATION:\n"
-        display_text += "-" * 50 + "\n"
-        display_text += f"[INPUT] Input:  {input_path if input_path else '[ERROR] Not set - Click Browse button'}\n"
-        display_text += f"[OUTPUT] Output: {output_path if output_path else '[ERROR] Not set - Click Browse button'}\n"
-        display_text += f"[MUSIC] Music:  {os.path.join(os.path.dirname(__file__), 'Music')} ({len(self.get_music_files())} tracks) [OK]\n"
-        display_text += f"Intros: {os.path.join(os.path.dirname(__file__), 'Intros')} ({len(self.get_intro_files())} videos) [OK]\n"
-        display_text += f"[TOOLS] FFmpeg: Included in package [OK]\n"
-        display_text += "-" * 50 + "\n"
-        
-        # Add status based on configuration
-        if input_path and output_path:
-            display_text += "[OK] Ready to compile videos!"
-        else:
-            display_text += "[WARN] Please set input and output folders above"
-        
-        self.paths_text.insert(1.0, display_text)
+        music_dir = self.get_music_dir()
+        intro_dir = self.get_intro_dir()
+        selected_clips = len(getattr(self, 'clip_selection_files', []))
+        timeframe_label = self.get_clip_timeframe_label() if hasattr(self, 'clip_timeframe_var') else '1 week'
+        ready = "Ready" if input_path and output_path else "Set input and output folders"
+        display_text = (
+            f"[CONFIG] {ready}\n"
+            f"[INPUT] {input_path if input_path else 'Not set'}\n"
+            f"[OUTPUT] {output_path if output_path else 'Not set'}\n"
+            f"[MUSIC] {music_dir} ({len(self.get_music_files())} tracks) | "
+            f"[INTRO] {intro_dir} ({len(self.get_intro_files())} files) | "
+            f"[CLIPS] {selected_clips} selected | [TIMEFRAME] {timeframe_label} | "
+            f"[ORDER] {self.clip_order_var.get() or 'newest_first'} | [FFMPEG] Included"
+        )
+        self.config_summary_var.set(display_text)
         
     def get_music_files(self):
         """Get list of available music files"""
-        music_dir = os.path.join(os.path.dirname(__file__), "Music")
+        music_dir = self.get_music_dir()
         if os.path.exists(music_dir):
-            return [f for f in os.listdir(music_dir) if f.lower().endswith(('.mp3', '.wav', '.m4a'))]
+            return [f for f in os.listdir(music_dir) if f.lower().endswith(self.MUSIC_EXTENSIONS)]
         return []
         
     def get_intro_files(self):
         """Get list of available intro files"""
-        intro_dir = os.path.join(os.path.dirname(__file__), "Intros")
+        intro_dir = self.get_intro_dir()
         if os.path.exists(intro_dir):
-            return [f for f in os.listdir(intro_dir) if f.lower().endswith(('.mp4', '.mov', '.avi'))]
+            return [f for f in os.listdir(intro_dir) if f.lower().endswith(self.INTRO_EXTENSIONS)]
         return []
+
+    def refresh_license_status(self):
+        """Refresh license/trial status from the server, falling back to signed local state."""
+        if autovid_license is None:
+            self.root.after(0, lambda: self.license_status_var.set("License module unavailable"))
+            return
+        license_api = get_autovid_license()
+        status = license_api.get_status(prefer_remote=True)
+        self.root.after(0, lambda s=status: self.apply_license_status(s))
+
+    def open_demo_video(self):
+        """Open the demo video when a public URL is configured."""
+        demo_url = self.config.get("demo_video_url", "").strip()
+        if demo_url:
+            webbrowser.open(demo_url)
+        else:
+            messagebox.showinfo(
+                "Demo Video Placeholder",
+                "Record and publish the demo video, then add its YouTube URL to gui_config.json as demo_video_url."
+            )
+
+    def apply_license_status(self, status):
+        """Display current license status."""
+        try:
+            license_api = get_autovid_license()
+            self.license_status_var.set(license_api.status_line(status))
+        except Exception:
+            self.license_status_var.set("License status unavailable")
+
+    def ensure_compile_entitlement(self):
+        """Consume one compile entitlement before FFmpeg work starts."""
+        if autovid_license is None:
+            messagebox.showerror(
+                "License Error",
+                "The license module could not be loaded. Reinstall the app or download the latest release."
+            )
+            return False
+
+        license_api = get_autovid_license()
+        ok, status, warning = license_api.consume_use()
+        self.apply_license_status(status)
+        if warning:
+            self.log_warning(warning)
+
+        if ok:
+            self.license_use_consumed_for_run = True
+            entitlement = status.get("entitlement", "use")
+            self.log_status(f"[LICENSE] Recorded one {entitlement} compilation use.")
+            return True
+
+        self.show_checkout_window()
+        messagebox.showinfo(
+            "License Required",
+            str(warning or "Buy a credit pack or monthly unlimited access to continue.")
+        )
+        return False
+
+    def record_successful_compile_use(self):
+        """Count one completed compilation after a successful output."""
+        if autovid_license is None:
+            return
+        if self.license_use_consumed_for_run:
+            threading.Thread(target=self.refresh_license_status, daemon=True).start()
+            self.log_status("[LICENSE] Compile entitlement was already recorded before processing.")
+            return
+        license_api = get_autovid_license()
+        ok, status, warning = license_api.consume_use()
+        self.apply_license_status(status)
+        if warning:
+            self.log_warning(warning)
+        if ok:
+            entitlement = status.get("entitlement", "use")
+            self.log_status(f"[LICENSE] Recorded one {entitlement} compilation use.")
+        else:
+            self.log_warning("Compilation completed, but no license credit could be recorded. Please refresh licensing.")
+            self.show_checkout_window()
+
+    def show_checkout_window(self):
+        """Open the in-app purchase dialog. Stripe card entry stays on Stripe-hosted checkout."""
+        if autovid_license is None:
+            messagebox.showerror("License Error", "License module is unavailable.")
+            return
+
+        license_api = get_autovid_license()
+
+        if self.checkout_window and self.checkout_window.winfo_exists():
+            self.checkout_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.checkout_window = window
+        window.title("Auto Vid Compiler Plans")
+        window.resizable(False, False)
+        window.configure(bg=self.colors['bg'])
+        self.position_child_window(window, width=520, height=360, modal=True)
+
+        try:
+            ico_path = self.get_icon_path()
+            if os.path.exists(ico_path):
+                window.iconbitmap(ico_path)
+        except Exception:
+            pass
+
+        self.checkout_status_var = tk.StringVar(value="Choose a plan. Secure payment is handled by Stripe Checkout.")
+        email_var = tk.StringVar()
+        plan_var = tk.StringVar(value="credits_12")
+        plans = [
+            ("credits_5", "$5 - 5 compile credits"),
+            ("credits_12", "$10 - 12 compile credits"),
+            ("monthly_unlimited", "$10/mo - unlimited compiles"),
+        ]
+
+        outer = tk.Frame(window, bg=self.colors['bg'], padx=18, pady=16)
+        outer.pack(fill='both', expand=True)
+
+        tk.Label(
+            outer,
+            text="Auto Vid Compiler Credits",
+            bg=self.colors['bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 15, 'bold')
+        ).pack(anchor='w', pady=(0, 10))
+
+        tk.Label(
+            outer,
+            textvariable=self.checkout_status_var,
+            bg=self.colors['bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 9),
+            wraplength=410,
+            justify='left'
+        ).pack(anchor='w', pady=(0, 12))
+
+        form = tk.Frame(outer, bg=self.colors['bg'])
+        form.pack(fill='x')
+
+        cached_status = license_api.get_status(prefer_remote=False)
+        email_var.set(cached_status.get("email", ""))
+
+        tk.Label(form, text="Email (required):", bg=self.colors['bg'], fg=self.colors['label_color'], font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w', pady=5)
+        tk.Entry(form, textvariable=email_var, width=34).grid(row=0, column=1, sticky='ew', padx=(10, 0), pady=5)
+
+        tk.Label(form, text="Plan:", bg=self.colors['bg'], fg=self.colors['label_color'], font=('Segoe UI', 9)).grid(row=1, column=0, sticky='nw', pady=5)
+        plan_frame = tk.Frame(form, bg=self.colors['bg'])
+        plan_frame.grid(row=1, column=1, sticky='ew', padx=(10, 0), pady=5)
+        for value, label in plans:
+            tk.Radiobutton(
+                plan_frame,
+                text=label,
+                variable=plan_var,
+                value=value,
+                bg=self.colors['bg'],
+                fg=self.colors['label_color'],
+                selectcolor=self.colors['frame_bg'],
+                activebackground=self.colors['bg'],
+                activeforeground=self.colors['label_color'],
+                font=('Segoe UI', 9),
+            ).pack(anchor='w')
+        form.grid_columnconfigure(1, weight=1)
+
+        buttons = tk.Frame(outer, bg=self.colors['bg'])
+        buttons.pack(fill='x', pady=(18, 0))
+
+        tk.Button(
+            buttons,
+            text="Open Secure Stripe Checkout",
+            command=lambda: self.start_checkout(email_var.get(), plan_var.get()),
+            bg=self.colors['accent'],
+            fg='white',
+            font=('Segoe UI', 9, 'bold'),
+            relief='raised',
+            padx=10,
+            pady=6,
+            cursor='hand2',
+        ).pack(side='left')
+
+        tk.Button(
+            buttons,
+            text="I Paid - Refresh",
+            command=self.confirm_checkout_session,
+            bg=self.colors['button'],
+            fg='white',
+            font=('Segoe UI', 9),
+            relief='raised',
+            padx=10,
+            pady=6,
+            cursor='hand2',
+        ).pack(side='left', padx=(8, 0))
+
+        tk.Button(
+            buttons,
+            text="Close",
+            command=window.destroy,
+            bg='#666666',
+            fg='white',
+            font=('Segoe UI', 9),
+            relief='raised',
+            padx=10,
+            pady=6,
+            cursor='hand2',
+        ).pack(side='right')
+
+        recovery_hint = license_api.recovery_summary(cached_status)
+        tk.Label(
+            outer,
+            text=recovery_hint,
+            bg=self.colors['bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 8),
+            wraplength=470,
+            justify='left'
+        ).pack(anchor='w', pady=(14, 0))
+
+    def show_license_recovery_window(self):
+        """Open a dialog to restore a paid license onto this device."""
+        if autovid_license is None:
+            messagebox.showerror("License Error", "License module is unavailable.")
+            return
+
+        license_api = get_autovid_license()
+
+        if self.license_recovery_window and self.license_recovery_window.winfo_exists():
+            self.license_recovery_window.lift()
+            self.license_recovery_window.focus_force()
+            return
+
+        status = license_api.get_status(prefer_remote=False)
+        window = tk.Toplevel(self.root)
+        self.license_recovery_window = window
+        window.title("Restore Auto Vid Compiler License")
+        window.resizable(False, False)
+        window.configure(bg=self.colors['bg'])
+        self.position_child_window(window, width=560, height=320, modal=True)
+
+        try:
+            ico_path = self.get_icon_path()
+            if os.path.exists(ico_path):
+                window.iconbitmap(ico_path)
+        except Exception:
+            pass
+
+        status_var = tk.StringVar(value="Enter the recovery email and key from your paid checkout.")
+        email_var = tk.StringVar(value=status.get("email", ""))
+        key_var = tk.StringVar(value=status.get("license_key", ""))
+
+        outer = tk.Frame(window, bg=self.colors['bg'], padx=18, pady=16)
+        outer.pack(fill='both', expand=True)
+
+        tk.Label(
+            outer,
+            text="Restore Paid License",
+            bg=self.colors['bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 15, 'bold')
+        ).pack(anchor='w', pady=(0, 10))
+
+        tk.Label(
+            outer,
+            textvariable=status_var,
+            bg=self.colors['bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 9),
+            wraplength=500,
+            justify='left'
+        ).pack(anchor='w', pady=(0, 12))
+
+        tk.Label(outer, text="Recovery email:", bg=self.colors['bg'], fg=self.colors['label_color'], font=('Segoe UI', 9)).pack(anchor='w')
+        tk.Entry(outer, textvariable=email_var, width=46).pack(fill='x', pady=(4, 10))
+
+        tk.Label(outer, text="Recovery key:", bg=self.colors['bg'], fg=self.colors['label_color'], font=('Segoe UI', 9)).pack(anchor='w')
+        tk.Entry(outer, textvariable=key_var, width=46).pack(fill='x', pady=(4, 10))
+
+        tk.Label(
+            outer,
+            text=license_api.recovery_summary(status),
+            bg=self.colors['bg'],
+            fg=self.colors['label_color'],
+            font=('Segoe UI', 8),
+            wraplength=500,
+            justify='left'
+        ).pack(anchor='w', pady=(2, 0))
+
+        button_row = tk.Frame(outer, bg=self.colors['bg'])
+        button_row.pack(fill='x', pady=(18, 0))
+
+        def copy_key():
+            key = key_var.get().strip()
+            if not key:
+                messagebox.showinfo("Copy Recovery Key", "There is no recovery key to copy yet.")
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(key)
+            status_var.set("Recovery key copied to clipboard.")
+
+        def activate():
+            email = email_var.get().strip()
+            license_key = key_var.get().strip()
+            if not email or not license_key:
+                status_var.set("Both recovery email and recovery key are required.")
+                return
+            status_var.set("Restoring paid license onto this device...")
+
+            def worker():
+                result = license_api.activate_license(email=email, license_key=license_key)
+                if result.get("ok"):
+                    self.root.after(0, lambda r=result: self.apply_license_status(r))
+                    message = str(result.get("recovery_message") or "Paid access restored onto this device.")
+                    self.root.after(0, lambda m=message: status_var.set(m))
+                    self.root.after(0, lambda m=message: self.log_status(f"[LICENSE] {m}"))
+                    self.root.after(0, lambda m=message: messagebox.showinfo("License Restored", m))
+                else:
+                    error = str(result.get("error", "Could not restore that license."))
+                    self.root.after(0, lambda e=error: status_var.set(e))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        tk.Button(
+            button_row,
+            text="Activate on This Device",
+            command=activate,
+            bg=self.colors['accent'],
+            fg='white',
+            font=('Segoe UI', 9, 'bold'),
+            relief='raised',
+            padx=10,
+            pady=6,
+            cursor='hand2',
+        ).pack(side='left')
+
+        tk.Button(
+            button_row,
+            text="Copy Key",
+            command=copy_key,
+            bg=self.colors['button'],
+            fg='white',
+            font=('Segoe UI', 9),
+            relief='raised',
+            padx=10,
+            pady=6,
+            cursor='hand2',
+        ).pack(side='left', padx=(8, 0))
+
+        tk.Button(
+            button_row,
+            text="Close",
+            command=window.destroy,
+            bg='#666666',
+            fg='white',
+            font=('Segoe UI', 9),
+            relief='raised',
+            padx=10,
+            pady=6,
+            cursor='hand2',
+        ).pack(side='right')
+
+        window.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, 'license_recovery_window', None), window.destroy()))
+
+    def start_checkout(self, email, plan_id):
+        """Create a Stripe Checkout session and open it."""
+        if autovid_license is None:
+            return
+        license_api = get_autovid_license()
+        email = (email or "").strip()
+        if not email:
+            if hasattr(self, 'checkout_status_var'):
+                self.checkout_status_var.set("Enter a recovery email before opening Stripe Checkout.")
+            messagebox.showerror("Recovery Email Required", "Paid plans require a recovery email so credits and subscriptions can be restored on a new device.")
+            return
+        self.checkout_status_var.set("Creating Stripe Checkout session...")
+
+        def worker():
+            result = license_api.create_checkout_session(email=email, plan_id=plan_id)
+            if result.get("ok") and result.get("url"):
+                self.checkout_session_id = result.get("session_id", "")
+                license_api.open_checkout_url(str(result.get("url") or ""))
+                self.root.after(0, lambda: self.checkout_status_var.set(
+                    "Stripe Checkout opened in your browser. Return here after payment and click refresh."
+                ))
+                self.root.after(5000, self.poll_checkout_status)
+            else:
+                error = str(result.get("error", "Could not create checkout session."))
+                self.root.after(0, lambda e=error: self.checkout_status_var.set(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def confirm_checkout_session(self):
+        """Manually refresh the current checkout session."""
+        if not self.checkout_session_id:
+            if hasattr(self, 'checkout_status_var'):
+                self.checkout_status_var.set("No checkout session has been started yet.")
+            return
+        self.poll_checkout_status()
+
+    def poll_checkout_status(self):
+        """Check whether Stripe has marked the checkout session paid."""
+        if autovid_license is None or not self.checkout_session_id:
+            return
+        if self.checkout_window and not self.checkout_window.winfo_exists():
+            return
+
+        license_api = get_autovid_license()
+
+        def worker():
+            result = license_api.confirm_session(self.checkout_session_id)
+            if result.get("ok") and result.get("paid"):
+                recovery_note = license_api.recovery_summary(result)
+                self.checkout_session_id = ""
+                self.root.after(0, lambda: self.checkout_status_var.set(f"Payment confirmed. Credits added. {recovery_note}"))
+                self.root.after(0, lambda: self.apply_license_status(result))
+                self.root.after(0, lambda: messagebox.showinfo("Payment Confirmed", f"Payment confirmed.\n\n{recovery_note}"))
+                return
+            message = str(result.get("error", "Payment has not completed yet."))
+            self.root.after(0, lambda m=message: self.checkout_status_var.set(m))
+            if self.checkout_window and self.checkout_window.winfo_exists():
+                self.root.after(5000, self.poll_checkout_status)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _copy_selected_files(self, title, target_folder, filetypes, refresh_callback):
+        """Import selected files into an app media folder."""
+        os.makedirs(target_folder, exist_ok=True)
+        selected = filedialog.askopenfilenames(title=title, filetypes=filetypes)
+        if not selected:
+            return
+
+        copied = 0
+        for src in selected:
+            if not os.path.isfile(src):
+                continue
+            base, ext = os.path.splitext(os.path.basename(src))
+            target = os.path.join(target_folder, base + ext)
+            index = 1
+            while os.path.exists(target):
+                target = os.path.join(target_folder, f"{base}_{index}{ext}")
+                index += 1
+            shutil.copy2(src, target)
+            copied += 1
+
+        refresh_callback()
+        self.update_paths_display()
+        self.log_success(f"Imported {copied} file(s) into {target_folder}")
+
+    def add_music_files(self):
+        """Add one or more background music files."""
+        music_dir = self.get_music_dir()
+        self._copy_selected_files(
+            "Add background music (MP3, WAV, M4A, OGG, FLAC, AAC)",
+            music_dir,
+            (("Audio files", "*.mp3 *.wav *.m4a *.ogg *.flac *.aac"), ("All files", "*.*")),
+            self.refresh_music_list,
+        )
+
+    def add_intro_files(self):
+        """Add one or more intro videos or GIFs."""
+        intro_dir = self.get_intro_dir()
+        self._copy_selected_files(
+            "Add intro video or GIF (MP4, AVI, MOV, MKV, WEBM, M4V, GIF)",
+            intro_dir,
+            (("Intro media", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v *.gif"), ("All files", "*.*")),
+            self.refresh_intro_list,
+        )
+
+    def get_input_video_paths(self):
+        """Return input videos for the custom ordering dialog."""
+        folder = self.input_path_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            return []
+        files = []
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path) and name.lower().endswith(self.VIDEO_EXTENSIONS):
+                files.append(path)
+        files.sort(key=os.path.getmtime, reverse=True)
+        return files
+
+    def get_clip_timeframe_seconds(self):
+        """Return the selected recency window in seconds, or None when unlimited."""
+        return {
+            '1_day': 24 * 60 * 60,
+            '1_week': 7 * 24 * 60 * 60,
+            '2_weeks': 14 * 24 * 60 * 60,
+            '1_month': 30 * 24 * 60 * 60,
+            'all': None,
+        }.get(self.clip_timeframe_var.get(), 7 * 24 * 60 * 60)
+
+    def get_clip_timeframe_label(self):
+        """Return the current recency-bubble label."""
+        for label, value in self.CLIP_TIMEFRAME_OPTIONS:
+            if value == self.clip_timeframe_var.get():
+                return label
+        return '1 week'
+
+    def filter_video_paths_by_timeframe(self, files):
+        """Filter video paths to the active recency window."""
+        cutoff_seconds = self.get_clip_timeframe_seconds()
+        if cutoff_seconds is None:
+            return list(files)
+        cutoff = time.time() - cutoff_seconds
+        filtered = []
+        for path in files:
+            try:
+                if os.path.getmtime(path) >= cutoff:
+                    filtered.append(path)
+            except OSError:
+                continue
+        return filtered
+
+    def load_clip_selection_snapshot(self):
+        """Load the saved clip-selection snapshot that drives compilation."""
+        if not os.path.exists(self.custom_order_file):
+            return {}
+        try:
+            with open(self.custom_order_file, 'r', encoding='utf-8-sig') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                clip_settings = data.get('clip_settings', {})
+                if isinstance(clip_settings, dict):
+                    loaded_overrides = {}
+                    for path, settings in clip_settings.items():
+                        if isinstance(settings, dict):
+                            trim_seconds = settings.get('trim_seconds')
+                        else:
+                            trim_seconds = settings
+                        try:
+                            trim_value = int(float(str(trim_seconds)))
+                        except (TypeError, ValueError):
+                            continue
+                        if trim_value > 0:
+                            loaded_overrides[self.normalize_clip_path(path)] = trim_value
+                    self.clip_trim_overrides = loaded_overrides
+            if isinstance(data, list):
+                return {'paths': data}
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            print(f"Error loading clip selection snapshot: {e}")
+        return {}
+
+    def normalize_clip_path(self, video_path):
+        """Return a normalized absolute path for clip lookup."""
+        return os.path.normcase(os.path.abspath(video_path))
+
+    def get_default_clip_trim_seconds(self):
+        """Return the global trim seconds setting, or None when using the full clip."""
+        value = str(self.trim_seconds_var.get() or '').strip()
+        if not value or value == 'None':
+            return None
+        try:
+            parsed = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def get_clip_trim_seconds(self, video_path):
+        """Return the effective trim seconds for a clip, including any per-clip override."""
+        normalized = self.normalize_clip_path(video_path)
+        if normalized in self.clip_trim_overrides:
+            return self.clip_trim_overrides[normalized]
+        return self.get_default_clip_trim_seconds()
+
+    def get_clip_trim_badge_text(self, video_path):
+        """Return the seconds badge shown on each clip card."""
+        trim_seconds = self.get_clip_trim_seconds(video_path)
+        return f"{trim_seconds}s" if trim_seconds is not None else 'Full'
+
+    def get_clip_trim_input_value(self, video_path):
+        """Return the inline card value shown in the per-clip trim box."""
+        trim_seconds = self.get_clip_trim_seconds(video_path)
+        return 'Full' if trim_seconds is None else str(int(trim_seconds))
+
+    def clear_clip_trim_inputs(self):
+        """Destroy any inline trim controls before redrawing the clip canvas."""
+        for widget in self.clip_trim_inputs.values():
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+        self.clip_trim_inputs = {}
+
+    def commit_inline_clip_trim(self, video_path, trim_var):
+        """Persist the per-clip trim box value from the card itself."""
+        previous_trim = self.get_clip_trim_seconds(video_path)
+        default_trim = self.get_default_clip_trim_seconds()
+        raw_value = str(trim_var.get() or '').strip()
+
+        if not raw_value:
+            self.set_clip_trim_override(video_path, None)
+        else:
+            lowered = raw_value.lower()
+            if lowered in {'default', 'full', 'none'}:
+                self.set_clip_trim_override(video_path, None)
+            else:
+                try:
+                    trim_seconds = int(float(raw_value))
+                except (TypeError, ValueError):
+                    trim_var.set(self.get_clip_trim_input_value(video_path))
+                    messagebox.showerror("Invalid Seconds", "Enter a whole number of seconds for this clip.")
+                    return 'break'
+                if trim_seconds <= 0:
+                    trim_var.set(self.get_clip_trim_input_value(video_path))
+                    messagebox.showerror("Invalid Seconds", "Clip seconds must be greater than zero.")
+                    return 'break'
+                if default_trim is not None and trim_seconds == default_trim:
+                    self.set_clip_trim_override(video_path, None)
+                else:
+                    self.set_clip_trim_override(video_path, trim_seconds)
+
+        trim_var.set(self.get_clip_trim_input_value(video_path))
+        self.persist_clip_selection_snapshot(log_message=False)
+
+        current_trim = self.get_clip_trim_seconds(video_path)
+        if current_trim != previous_trim:
+            clip_name = os.path.basename(video_path)
+            if self.normalize_clip_path(video_path) in self.clip_trim_overrides:
+                self.log_status(f"[CLIPS] Set {clip_name} to {self.get_clip_trim_badge_text(video_path)}")
+            else:
+                default_label = self.get_clip_trim_badge_text(video_path)
+                self.log_status(f"[CLIPS] Reset {clip_name} to the default {default_label}")
+        return 'break'
+
+    def reset_inline_clip_trim_value(self, video_path, trim_var):
+        """Restore the visible inline trim box text without changing saved state."""
+        trim_var.set(self.get_clip_trim_input_value(video_path))
+        return 'break'
+
+    def set_clip_trim_override(self, video_path, trim_seconds=None):
+        """Apply or clear a per-clip trim override."""
+        normalized = self.normalize_clip_path(video_path)
+        if trim_seconds is None:
+            self.clip_trim_overrides.pop(normalized, None)
+            return
+        self.clip_trim_overrides[normalized] = int(trim_seconds)
+
+    def sort_clip_selection_paths(self, files, order_mode=None):
+        """Sort clip paths according to the current clip-order selection."""
+        order_mode = (order_mode or self.clip_order_var.get() or 'newest_first').lower()
+        items = list(files)
+        if order_mode == 'oldest_first':
+            items.sort(key=os.path.getmtime)
+        elif order_mode == 'filename_az':
+            items.sort(key=lambda path: os.path.basename(path).lower())
+        elif order_mode == 'filename_za':
+            items.sort(key=lambda path: os.path.basename(path).lower(), reverse=True)
+        elif order_mode != 'custom':
+            items.sort(key=os.path.getmtime, reverse=True)
+        return items
+
+    def build_clip_selection_files(self, preserve_saved=True):
+        """Build the visible clip list so the UI and compiler stay in sync."""
+        filtered_files = self.filter_video_paths_by_timeframe(self.get_input_video_paths())
+        if not preserve_saved:
+            return self.sort_clip_selection_paths(filtered_files)
+
+        snapshot = self.load_clip_selection_snapshot()
+        if 'paths' not in snapshot:
+            return self.sort_clip_selection_paths(filtered_files)
+
+        current_folder = self.input_path_var.get().strip()
+        normalized_folder = os.path.normcase(os.path.abspath(current_folder)) if current_folder else ''
+        snapshot_folder = str(snapshot.get('source_folder', '') or '')
+        snapshot_timeframe = str(snapshot.get('timeframe', '') or '')
+
+        if snapshot_folder:
+            normalized_snapshot_folder = os.path.normcase(os.path.abspath(snapshot_folder))
+            if normalized_snapshot_folder != normalized_folder:
+                return self.sort_clip_selection_paths(filtered_files)
+        if snapshot_timeframe and snapshot_timeframe != self.clip_timeframe_var.get():
+            return self.sort_clip_selection_paths(filtered_files)
+
+        available_map = {
+            os.path.normcase(os.path.abspath(path)): path
+            for path in filtered_files
+        }
+        saved_paths = []
+        for path in snapshot.get('paths', []):
+            normalized = os.path.normcase(os.path.abspath(path))
+            if normalized in available_map:
+                saved_paths.append(available_map[normalized])
+
+        if saved_paths or not snapshot.get('paths'):
+            if self.clip_order_var.get() == 'custom':
+                return saved_paths
+            return self.sort_clip_selection_paths(saved_paths)
+
+        return self.sort_clip_selection_paths(filtered_files)
+
+    def persist_clip_selection_snapshot(self, log_message=False):
+        """Persist the visible clip list so compilation matches the GUI."""
+        if not hasattr(self, 'clip_selection_files'):
+            return
+        os.makedirs(os.path.dirname(self.custom_order_file), exist_ok=True)
+        clip_settings = {
+            path: {'trim_seconds': self.clip_trim_overrides[self.normalize_clip_path(path)]}
+            for path in self.clip_selection_files
+            if self.normalize_clip_path(path) in self.clip_trim_overrides
+        }
+        payload = {
+            'paths': list(self.clip_selection_files),
+            'saved_at': int(time.time()),
+            'source_folder': self.input_path_var.get().strip(),
+            'timeframe': self.clip_timeframe_var.get(),
+            'clip_order': self.clip_order_var.get(),
+            'clip_settings': clip_settings,
+        }
+        try:
+            with open(self.custom_order_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2)
+            self.save_config()
+            all_files = self.get_input_video_paths()
+            filtered_count = len(self.filter_video_paths_by_timeframe(all_files))
+            total_count = len(all_files)
+            summary = f"{len(self.clip_selection_files)} selected | {filtered_count} in {self.get_clip_timeframe_label()}"
+            if total_count != filtered_count:
+                summary += f" | {total_count} total"
+            summary += f" | {self.clip_order_var.get()}"
+            self.clip_selection_summary_var.set(summary)
+            self.update_paths_display()
+            if log_message:
+                self.log_success(f"Saved {len(self.clip_selection_files)} selected clips")
+        except Exception as e:
+            self.log_error(f"Could not save clip selection: {e}")
+
+    def refresh_clip_selection_panel(self, preserve_saved=True, save_snapshot=True):
+        """Refresh the embedded clip-selection panel."""
+        all_files = self.get_input_video_paths()
+        filtered_files = self.filter_video_paths_by_timeframe(all_files)
+        self.clip_selection_files = self.build_clip_selection_files(preserve_saved=preserve_saved)
+
+        if self.clip_selection_files:
+            self.clip_selected_index = max(0, min(self.clip_selected_index, len(self.clip_selection_files) - 1))
+        else:
+            self.clip_selected_index = 0
+            self.clip_drag_index = None
+
+        selection_count = len(self.clip_selection_files)
+        filtered_count = len(filtered_files)
+        total_count = len(all_files)
+        summary = f"{selection_count} selected | {filtered_count} in {self.get_clip_timeframe_label()}"
+        if total_count != filtered_count:
+            summary += f" | {total_count} total"
+        summary += f" | {self.clip_order_var.get()}"
+        self.clip_selection_summary_var.set(summary)
+
+        self.draw_clip_selection_rows()
+        if save_snapshot:
+            self.persist_clip_selection_snapshot(log_message=False)
+
+    def on_clip_timeframe_changed(self):
+        """Refresh the clip-selection list when the recency bubble changes."""
+        self.save_config()
+        self.refresh_clip_selection_panel(preserve_saved=False)
+
+    def on_clip_order_changed(self, _event=None):
+        """Persist clip-order selection and refresh the embedded clip-selection panel."""
+        self.save_config()
+        self.refresh_clip_selection_panel(preserve_saved=True)
+
+    def on_trim_seconds_changed(self, _event=None):
+        """Refresh card badges when the global trim duration changes."""
+        self.save_config()
+        self.draw_clip_selection_rows()
+        self.persist_clip_selection_snapshot(log_message=False)
+
+    def set_progress(self, percent, message):
+        """Thread-safe progress update."""
+        def update():
+            clamped = max(0, min(100, float(percent)))
+            self.progress_var.set(clamped)
+            self.progress_text_var.set(f"{clamped:.0f}% - {message}")
+        if threading.current_thread() != threading.main_thread():
+            self.root.after(0, update)
+        else:
+            update()
+
+    def request_stop(self):
+        """Request cancellation of the active compilation."""
+        self.stop_requested = True
+        self.log_warning("Stop requested. The current FFmpeg step will be cancelled as soon as possible.")
+        self.set_progress(self.progress_var.get(), "Stopping...")
+        if hasattr(self, 'stop_btn'):
+            self.stop_btn.configure(state='disabled')
+
+    def create_video_thumbnail(self, video_path, size=(160, 90)):
+        """Create or load a thumbnail image for a video."""
+        cache_key = hashlib.sha256(f"{video_path}|{os.path.getmtime(video_path)}".encode("utf-8", errors="ignore")).hexdigest()
+        thumb_path = os.path.join(self.get_thumbnail_dir(), f"{cache_key}.jpg")
+        if not os.path.exists(thumb_path):
+            ffmpeg_path = self.get_ffmpeg_path()
+            if ffmpeg_path:
+                try:
+                    subprocess.run(
+                        [
+                            ffmpeg_path,
+                            "-y",
+                            "-ss",
+                            "00:00:01",
+                            "-i",
+                            video_path,
+                            "-frames:v",
+                            "1",
+                            "-vf",
+                            f"scale={size[0]}:{size[1]}:force_original_aspect_ratio=decrease,pad={size[0]}:{size[1]}:(ow-iw)/2:(oh-ih)/2",
+                            thumb_path,
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+                    )
+                except Exception:
+                    pass
+        try:
+            if os.path.exists(thumb_path):
+                img = Image.open(thumb_path).convert("RGB").resize(size, Image.Resampling.LANCZOS)
+            else:
+                raise FileNotFoundError
+        except Exception:
+            img = Image.new("RGB", size, "#1b2632")
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(img)
+            draw.rectangle((0, 0, size[0] - 1, size[1] - 1), outline="#2E8B57", width=2)
+            draw.polygon(
+                [(size[0] // 2 - 12, size[1] // 2 - 18), (size[0] // 2 - 12, size[1] // 2 + 18), (size[0] // 2 + 18, size[1] // 2)],
+                fill="#64ffda",
+            )
+        return ImageTk.PhotoImage(img)
+
+    def truncate_text_end(self, text, max_length):
+        """Truncate text from the end with an ellipsis."""
+        if len(text) <= max_length:
+            return text
+        return text[:max(0, max_length - 3)].rstrip('-_ ') + "..."
+
+    def truncate_text_start(self, text, max_length):
+        """Truncate text from the beginning with an ellipsis."""
+        if len(text) <= max_length:
+            return text
+        return "..." + text[-max(0, max_length - 3):]
+
+    def format_clip_display_name(self, video_path, max_length=44):
+        """Format clip names for dense card display."""
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        known_prefix = "recording-Ultima_Online_Retail-"
+        if base_name.startswith(known_prefix):
+            return self.truncate_text_end(base_name[len(known_prefix):], max_length)
+        return self.truncate_text_start(base_name, max_length)
+
+    def format_clip_time_label(self, video_path):
+        """Format the clip timestamp shown under each card."""
+        return time.strftime("%m/%d/%y %I:%M %p", time.localtime(os.path.getmtime(video_path)))
+
+    def preview_custom_order_video(self, video_path):
+        """Preview a clip in an always-on-top window centered over the GUI."""
+        self.stop_preview()
+        ffplay_path = self.get_ffplay_path()
+        if ffplay_path:
+            try:
+                self.root.update_idletasks()
+                preview_width = max(720, min(1280, int(self.root.winfo_width() * 0.72)))
+                preview_height = max(405, int(preview_width * 9 / 16))
+                left = self.root.winfo_x() + max(20, (self.root.winfo_width() - preview_width) // 2)
+                top = self.root.winfo_y() + max(20, (self.root.winfo_height() - preview_height) // 2)
+                self.preview_process = subprocess.Popen(
+                    [
+                        ffplay_path,
+                        "-autoexit",
+                        "-alwaysontop",
+                        "-window_title",
+                        os.path.basename(video_path),
+                        "-left",
+                        str(left),
+                        "-top",
+                        str(top),
+                        "-x",
+                        str(preview_width),
+                        "-y",
+                        str(preview_height),
+                        video_path,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except Exception:
+                pass
+        try:
+            os.startfile(video_path)
+        except Exception as e:
+            messagebox.showerror("Preview Error", f"Could not preview video:\n{e}")
+
+    def stop_preview(self):
+        """Stop the current preview process if ffplay is running."""
+        if self.preview_process and self.preview_process.poll() is None:
+            try:
+                self.preview_process.terminate()
+            except Exception:
+                pass
+        self.preview_process = None
+
+    def show_custom_order_window(self):
+        """Focus the embedded clip-selection panel instead of opening a separate window."""
+        if not self.get_input_video_paths():
+            messagebox.showwarning("Clip Selection", "Select an input folder with supported video files first.")
+            return
+        self.refresh_clip_selection_panel(preserve_saved=True, save_snapshot=False)
+        if self.clip_selection_canvas:
+            self.clip_selection_canvas.focus_set()
+            if self.clip_selection_files:
+                position = self.clip_selected_index / max(1, len(self.clip_selection_files))
+                self.clip_selection_canvas.yview_moveto(position)
+
+    def show_clip_preview_window(self, index=None):
+        """Open a centered clip preview/editor window for per-clip trim overrides."""
+        if not self.clip_selection_files:
+            return
+        if index is None:
+            index = self.clip_selected_index
+        index = max(0, min(len(self.clip_selection_files) - 1, index))
+        self.clip_selected_index = index
+        video_path = self.clip_selection_files[index]
+
+        if self.clip_preview_window and self.clip_preview_window.winfo_exists():
+            try:
+                self.clip_preview_window.destroy()
+            except Exception:
+                pass
+
+        window = tk.Toplevel(self.root)
+        self.clip_preview_window = window
+        window.title("Clip Preview")
+        window.configure(bg=self.colors['bg'])
+        self.position_child_window(window, width=520, height=350, modal=True)
+        try:
+            window.iconbitmap(self.get_icon_path())
+        except Exception:
+            pass
+
+        current_trim = self.get_clip_trim_seconds(video_path)
+        default_trim = self.get_default_clip_trim_seconds()
+        trim_var = tk.StringVar(value="" if current_trim is None else str(current_trim))
+
+        outer = tk.Frame(window, bg=self.colors['bg'], padx=14, pady=14)
+        outer.pack(fill='both', expand=True)
+
+        preview_thumb = self.create_video_thumbnail(video_path, size=(320, 180))
+        thumb_label = tk.Label(outer, image=preview_thumb, bg=self.colors['bg'])
+        self.clip_preview_thumb = preview_thumb
+        thumb_label.pack(pady=(0, 10))
+
+        tk.Label(
+            outer,
+            text=self.format_clip_display_name(video_path, max_length=72),
+            bg=self.colors['bg'],
+            fg='white',
+            font=('Segoe UI', 10, 'bold'),
+            wraplength=460,
+            justify='center',
+        ).pack()
+
+        tk.Label(
+            outer,
+            text=f"Recorded {self.format_clip_time_label(video_path)} | Current clip length {self.get_clip_trim_badge_text(video_path)}",
+            bg=self.colors['bg'],
+            fg='#c6d0dc',
+            font=('Segoe UI', 8),
+        ).pack(pady=(4, 10))
+
+        trim_row = tk.Frame(outer, bg=self.colors['bg'])
+        trim_row.pack(fill='x', pady=(0, 10))
+
+        tk.Label(
+            trim_row,
+            text="Seconds for this clip:",
+            bg=self.colors['bg'],
+            fg='white',
+            font=('Segoe UI', 9, 'bold'),
+        ).pack(side='left')
+
+        trim_entry = tk.Spinbox(trim_row, from_=1, to=300, increment=1, textvariable=trim_var, width=8)
+        trim_entry.pack(side='left', padx=(8, 8))
+
+        tk.Label(
+            trim_row,
+            text=f"Default {default_trim}s" if default_trim is not None else "Default Full",
+            bg=self.colors['bg'],
+            fg='#c6d0dc',
+            font=('Segoe UI', 8),
+        ).pack(side='left')
+
+        button_row = tk.Frame(outer, bg=self.colors['bg'])
+        button_row.pack(fill='x')
+
+        def apply_trim():
+            raw_value = str(trim_var.get() or '').strip()
+            if not raw_value:
+                self.set_clip_trim_override(video_path, None)
+            else:
+                try:
+                    trim_seconds = int(float(raw_value))
+                except ValueError:
+                    messagebox.showerror("Invalid Seconds", "Enter a whole number of seconds for this clip.")
+                    return
+                if trim_seconds <= 0:
+                    messagebox.showerror("Invalid Seconds", "Clip seconds must be greater than zero.")
+                    return
+                self.set_clip_trim_override(video_path, trim_seconds)
+            self.persist_clip_selection_snapshot(log_message=False)
+            self.draw_clip_selection_rows()
+            self.log_success(f"Updated clip length for {os.path.basename(video_path)}")
+
+        def reset_trim():
+            trim_var.set('')
+            self.set_clip_trim_override(video_path, None)
+            self.persist_clip_selection_snapshot(log_message=False)
+            self.draw_clip_selection_rows()
+            self.log_status(f"[CLIPS] Reset clip length for {os.path.basename(video_path)} to the default setting")
+
+        def close_window():
+            self.stop_preview()
+            self.clip_preview_window = None
+            window.destroy()
+
+        tk.Button(
+            button_row,
+            text="Play Over GUI",
+            command=lambda: self.preview_custom_order_video(video_path),
+            font=('Segoe UI', 8, 'bold'),
+            bg=self.colors['accent'],
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=10,
+            pady=4,
+        ).pack(side='left')
+
+        tk.Button(
+            button_row,
+            text="Apply Seconds",
+            command=apply_trim,
+            font=('Segoe UI', 8),
+            bg=self.colors['button'],
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=10,
+            pady=4,
+        ).pack(side='left', padx=(8, 0))
+
+        tk.Button(
+            button_row,
+            text="Use Default",
+            command=reset_trim,
+            font=('Segoe UI', 8),
+            bg='#666666',
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=10,
+            pady=4,
+        ).pack(side='left', padx=(8, 0))
+
+        tk.Button(
+            button_row,
+            text="Close",
+            command=close_window,
+            font=('Segoe UI', 8),
+            bg='#444444',
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=10,
+            pady=4,
+        ).pack(side='right')
+
+        tk.Label(
+            outer,
+            text="Preview opens centered over the main GUI. Use ffplay controls for seek/fullscreen.",
+            bg=self.colors['bg'],
+            fg='#8ea3b8',
+            font=('Segoe UI', 8),
+        ).pack(pady=(10, 0))
+
+        window.protocol("WM_DELETE_WINDOW", close_window)
+        self.preview_custom_order_video(video_path)
+
+    def draw_clip_selection_rows(self):
+        """Render the embedded clip-selection cards with a width-responsive multi-column layout."""
+        canvas = self.clip_selection_canvas
+        if not canvas:
+            return
+        self.clear_clip_trim_inputs()
+        canvas.delete("all")
+        self.clip_card_regions = []
+        canvas_width = max(canvas.winfo_width(), 980)
+        gutter_x = 12
+        gutter_y = 12
+        outer_pad = 12
+        target_card_width = 200
+        columns = max(1, min(6, int((canvas_width - (outer_pad * 2) + gutter_x) // (target_card_width + gutter_x))))
+        self.clip_cards_per_row = columns
+        cell_width = max(180, (canvas_width - (outer_pad * 2) - (gutter_x * (columns - 1))) // columns)
+        thumb_width = min(190, max(130, cell_width - 24))
+        thumb_height = int(thumb_width * 9 / 16)
+        card_height = thumb_height + 60
+        self.clip_row_height = card_height + gutter_y
+
+        if not self.clip_selection_files:
+            canvas.create_text(
+                canvas_width // 2,
+                90,
+                text="No videos match the current timeframe. Choose a wider bubble or a different folder.",
+                fill="#cdd6e3",
+                font=('Segoe UI', 11, 'bold'),
+            )
+            canvas.configure(scrollregion=(0, 0, canvas_width, 180))
+            return
+
+        for index, path in enumerate(self.clip_selection_files):
+            row = index // columns
+            column = index % columns
+            x0 = outer_pad + column * (cell_width + gutter_x)
+            y0 = outer_pad + row * (card_height + gutter_y)
+            x1 = x0 + cell_width
+            y1 = y0 + card_height
+            row_tag = f"clip_row_{index}"
+            remove_tag = f"clip_remove_{index}"
+            fill = "#23483d" if index == self.clip_selected_index else "#2b3138"
+            outline = "#64ffda" if index == self.clip_selected_index else "#3d4854"
+
+            thumb_key = f"{path}|{int(os.path.getmtime(path))}|{thumb_width}x{thumb_height}"
+            if thumb_key not in self.clip_thumbnail_cache:
+                self.clip_thumbnail_cache[thumb_key] = self.create_video_thumbnail(path, size=(thumb_width, thumb_height))
+
+            canvas.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline, width=2, tags=(row_tag,))
+            thumb_x = x0 + (cell_width - thumb_width) // 2
+            thumb_y = y0 + 10
+            canvas.create_image(thumb_x, thumb_y, image=self.clip_thumbnail_cache[thumb_key], anchor='nw', tags=(row_tag,))
+
+            badge_x1 = x0 + 10
+            badge_y1 = y0 + 10
+            badge_x2 = badge_x1 + 28
+            badge_y2 = badge_y1 + 22
+            canvas.create_rectangle(badge_x1, badge_y1, badge_x2, badge_y2, fill="#16242d", outline="#64ffda", width=1, tags=(row_tag,))
+            canvas.create_text((badge_x1 + badge_x2) // 2, (badge_y1 + badge_y2) // 2, text=str(index + 1), fill="#ffffff", font=('Segoe UI', 8, 'bold'), tags=(row_tag,))
+
+            remove_x1 = x1 - 82
+            remove_x2 = x1 - 10
+            remove_y1 = y0 + 10
+            remove_y2 = remove_y1 + 22
+            canvas.create_rectangle(remove_x1, remove_y1, remove_x2, remove_y2, fill=self.colors['error'], outline='#ff9e9e', width=1, tags=(remove_tag,))
+            canvas.create_text((remove_x1 + remove_x2) // 2, (remove_y1 + remove_y2) // 2, text="Remove", fill="white", font=('Segoe UI', 8, 'bold'), tags=(remove_tag,))
+
+            canvas.create_text(
+                (x0 + x1) // 2,
+                thumb_y + thumb_height + 10,
+                text=self.format_clip_display_name(path, max_length=max(18, min(34, int(cell_width / 7)))),
+                anchor='n',
+                fill="#ffffff",
+                font=('Segoe UI', 8, 'bold'),
+                width=cell_width - 18,
+                justify='center',
+                tags=(row_tag,),
+            )
+            canvas.create_text(
+                x0 + 10,
+                y1 - 12,
+                text=self.format_clip_time_label(path),
+                anchor='sw',
+                fill="#c6d0dc",
+                font=('Segoe UI', 7),
+                width=max(60, cell_width - 84),
+                justify='left',
+                tags=(row_tag,),
+            )
+
+            trim_var = tk.StringVar(master=self.root, value=self.get_clip_trim_input_value(path))
+            trim_entry = tk.Entry(
+                canvas,
+                textvariable=trim_var,
+                width=5,
+                justify='center',
+                font=('Segoe UI', 7, 'bold'),
+                bg="#163342",
+                fg="white",
+                insertbackground="white",
+                relief='solid',
+                bd=1,
+                highlightthickness=1,
+                highlightbackground="#74d9ff",
+                highlightcolor="#64ffda",
+            )
+            trim_entry.bind('<Return>', lambda _event, clip_path=path, var=trim_var: self.commit_inline_clip_trim(clip_path, var))
+            trim_entry.bind('<FocusOut>', lambda _event, clip_path=path, var=trim_var: self.commit_inline_clip_trim(clip_path, var))
+            trim_entry.bind('<Escape>', lambda _event, clip_path=path, var=trim_var: self.reset_inline_clip_trim_value(clip_path, var))
+            canvas.create_window(x1 - 10, y1 - 8, window=trim_entry, anchor='se')
+            self.clip_trim_inputs[index] = trim_entry
+
+            self.clip_card_regions.append((index, x0, y0, x1, y1))
+
+            canvas.tag_bind(row_tag, '<ButtonPress-1>', lambda _event, idx=index: self.start_clip_drag(idx))
+            canvas.tag_bind(row_tag, '<Double-Button-1>', lambda _event, idx=index: self.preview_selected_clip(idx))
+            canvas.tag_bind(remove_tag, '<ButtonPress-1>', lambda _event, idx=index: self.remove_clip_at_index(idx))
+
+        total_rows = (len(self.clip_selection_files) + columns - 1) // columns
+        content_height = max(card_height + (outer_pad * 2), outer_pad + total_rows * (card_height + gutter_y))
+        canvas.configure(scrollregion=(0, 0, canvas_width, content_height))
+
+    def clip_index_from_event(self, event):
+        """Translate a mouse event to the corresponding clip row index."""
+        canvas = self.clip_selection_canvas
+        if canvas is None or not self.clip_selection_files:
+            return 0
+        x = canvas.canvasx(event.x)
+        y = canvas.canvasy(event.y)
+        for index, x0, y0, x1, y1 in self.clip_card_regions:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return index
+        closest = min(
+            self.clip_card_regions,
+            key=lambda region: abs(((region[1] + region[3]) / 2) - x) + abs(((region[2] + region[4]) / 2) - y),
+        )
+        return closest[0]
+
+    def start_clip_drag(self, index):
+        """Select a clip row and prepare it for drag-reordering."""
+        if not self.clip_selection_files:
+            return
+        self.clip_selected_index = index
+        self.clip_drag_index = index
+        self.clip_drag_changed = False
+        if self.clip_selection_canvas:
+            self.clip_selection_canvas.configure(cursor='fleur')
+        self.draw_clip_selection_rows()
+
+    def on_clip_drag_motion(self, event):
+        """Reorder clip rows while dragging."""
+        if self.clip_drag_index is None or not self.clip_selection_files:
+            return
+        target = self.clip_index_from_event(event)
+        current = self.clip_drag_index
+        if target != current:
+            item = self.clip_selection_files.pop(current)
+            self.clip_selection_files.insert(target, item)
+            self.clip_drag_index = target
+            self.clip_selected_index = target
+            self.clip_drag_changed = True
+            self.draw_clip_selection_rows()
+
+    def on_clip_drag_end(self, _event=None):
+        """Finish a drag operation and persist the new clip order."""
+        if self.clip_drag_index is None:
+            return
+        self.clip_drag_index = None
+        if self.clip_selection_canvas:
+            self.clip_selection_canvas.configure(cursor='hand2')
+        if self.clip_drag_changed:
+            self.clip_order_var.set('custom')
+            self.persist_clip_selection_snapshot(log_message=False)
+        self.draw_clip_selection_rows()
+
+    def preview_selected_clip(self, index=None):
+        """Open the selected clip's centered preview/editor window."""
+        if not self.clip_selection_files:
+            return
+        if index is None:
+            index = self.clip_selected_index
+        index = max(0, min(len(self.clip_selection_files) - 1, index))
+        self.clip_selected_index = index
+        self.draw_clip_selection_rows()
+        self.show_clip_preview_window(index)
+
+    def remove_clip_at_index(self, index, log_message=True):
+        """Remove a clip from the active selection without deleting the source file."""
+        if index < 0 or index >= len(self.clip_selection_files):
+            return
+        removed = self.clip_selection_files.pop(index)
+        if self.clip_selection_files:
+            self.clip_selected_index = max(0, min(index, len(self.clip_selection_files) - 1))
+        else:
+            self.clip_selected_index = 0
+        self.persist_clip_selection_snapshot(log_message=False)
+        self.draw_clip_selection_rows()
+        if log_message:
+            self.log_warning(f"Removed {os.path.basename(removed)} from this compilation selection")
+
+    def remove_selected_clip(self):
+        """Remove the currently highlighted clip from the active selection."""
+        self.remove_clip_at_index(self.clip_selected_index)
     
     def run_compiler(self):
         """Run the video compiler with current settings"""
@@ -856,17 +2551,50 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 self.log_error(f"Could not create output directory: {e}")
                 messagebox.showerror("Directory Error", f"Could not create output directory:\n{e}")
                 return
+
+        video_candidates = [
+            name for name in os.listdir(input_path)
+            if os.path.isfile(os.path.join(input_path, name)) and name.lower().endswith(self.VIDEO_EXTENSIONS)
+        ]
+        if not video_candidates:
+            self.log_error("No supported video files were found in the input folder.")
+            messagebox.showerror(
+                "No Videos Found",
+                "The input folder does not contain any supported videos.\n\n"
+                f"Supported formats: {', '.join(self.VIDEO_EXTENSIONS)}"
+            )
+            return
+
+        self.refresh_clip_selection_panel(preserve_saved=True)
+        if not self.clip_selection_files:
+            self.log_error("No videos are selected for the current timeframe/clip selection.")
+            messagebox.showerror(
+                "No Selected Videos",
+                "The current clip selection is empty.\n\n"
+                "Widen the timeframe bubble or click Restore Filtered List before running the compiler."
+            )
+            return
+        self.persist_clip_selection_snapshot(log_message=False)
+
+        self.license_use_consumed_for_run = False
+        if not self.ensure_compile_entitlement():
+            return
         
         # FIXED: Clear status area BEFORE any operations that might log messages
         print("DEBUG: Clearing status text area BEFORE script path update")
-        self.status_text.delete(1.0, tk.END)
+        if self.status_text is not None:
+            self.status_text.delete(1.0, tk.END)
         print("DEBUG: Status text cleared")
+        self.stop_requested = False
+        self.set_progress(0, "Starting")
         
         # Update the main script with these paths
         self.update_main_script_paths(input_path, output_path)
         
         # Reset and disable run button for new compilation
         self.run_btn.configure(state='disabled', text="Compiling... Please Wait", bg=self.colors['warning'])
+        self.stop_btn.grid()
+        self.stop_btn.configure(state='normal')
         self.root.update_idletasks()  # Force immediate GUI update to show button change
         
         self.log_status("[START] Starting video compilation process...")
@@ -941,11 +2669,18 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             os.environ['TRIM_SECONDS'] = self.trim_seconds_var.get()
             os.environ['MUSIC_SELECTION'] = self.music_selection_var.get()
             os.environ['INTRO_SELECTION'] = self.intro_selection_var.get()
+            os.environ['CLIP_ORDER'] = self.clip_order_var.get()
+            os.environ['CUSTOM_ORDER_FILE'] = self.custom_order_file
+            os.environ['CLIP_TIMEFRAME'] = self.clip_timeframe_var.get()
+            os.environ['MUSIC_FOLDER'] = self.get_music_dir()
+            os.environ['INTRO_FOLDER'] = self.get_intro_dir()
             
             # Log the settings being used
             self.log_status(f"[CONFIG] Trim seconds: {self.trim_seconds_var.get()}")
             self.log_status(f"[CONFIG] Music selection: {self.music_selection_var.get()}")
             self.log_status(f"[CONFIG] Intro selection: {self.intro_selection_var.get()}")
+            self.log_status(f"[CONFIG] Clip order: {self.clip_order_var.get()}")
+            self.log_status(f"[CONFIG] Clip timeframe: {self.get_clip_timeframe_label()}")
             
             self.log_status("[PROCESS] Starting direct compilation...")
             
@@ -963,6 +2698,14 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                     UOVidCompiler.CONFIG['clip_duration'] = float(trim_value) if trim_value is not None else 999999.0
                     UOVidCompiler.CONFIG['video_folder'] = self.input_path_var.get()
                     UOVidCompiler.CONFIG['output_folder'] = self.output_path_var.get()
+                    UOVidCompiler.CONFIG['clip_order'] = self.clip_order_var.get()
+                    UOVidCompiler.CONFIG['custom_order_file'] = self.custom_order_file
+                    UOVidCompiler.CONFIG['clip_timeframe'] = self.clip_timeframe_var.get()
+                    UOVidCompiler.CONFIG['music_folder'] = self.get_music_dir()
+                    UOVidCompiler.CONFIG['intro_folder'] = self.get_intro_dir()
+                    UOVidCompiler.CONFIG['use_intro'] = self.intro_selection_var.get() != 'None'
+                    UOVidCompiler.CONFIG['progress_callback'] = self.set_progress
+                    UOVidCompiler.CONFIG['cancel_callback'] = lambda: self.stop_requested
                     self.log_status("[OK] CONFIG dictionary updated with GUI selections")
                 
                 # Create a custom stdout that writes to GUI in real-time
@@ -1026,6 +2769,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
     def _handle_compilation_completion(self, success):
         """Handle completion of compilation process"""
         if success:
+            self.record_successful_compile_use()
+            self.set_progress(100, "Compilation complete")
             self.log_status("[SUCCESS] Video compilation completed successfully!")
             messagebox.showinfo("Success!", 
                 "Video compilation completed successfully!\n\nYour compiled video is ready in the output folder.")
@@ -1034,6 +2779,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 text="[OK] Compilation Complete! Click to Compile Again",
                 bg=self.colors['success'])
         else:
+            self.set_progress(0, "Stopped or failed")
             self.log_status("[ERROR] Compilation failed")
             messagebox.showerror("Compilation Failed", 
                 "Compilation failed\n\nCheck the status log for details.")
@@ -1041,6 +2787,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 state='normal', 
                 text="[ERROR] Compilation Failed - Click to Try Again",
                 bg=self.colors['error'])
+        self.stop_btn.configure(state='disabled')
+        self.stop_btn.grid_remove()
                 
     def _run_subprocess_compilation(self):
         """Fallback subprocess compilation method"""
@@ -1054,6 +2802,11 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             env['TRIM_SECONDS'] = self.trim_seconds_var.get()
             env['MUSIC_SELECTION'] = self.music_selection_var.get()
             env['INTRO_SELECTION'] = self.intro_selection_var.get()
+            env['CLIP_ORDER'] = self.clip_order_var.get()
+            env['CUSTOM_ORDER_FILE'] = self.custom_order_file
+            env['CLIP_TIMEFRAME'] = self.clip_timeframe_var.get()
+            env['MUSIC_FOLDER'] = self.get_music_dir()
+            env['INTRO_FOLDER'] = self.get_intro_dir()
             
             process = subprocess.Popen(
                 [sys.executable, "-u", script_path],
@@ -1088,7 +2841,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
     
     def test_subprocess_output(self):
         """Test basic subprocess output capture"""
-        self.status_text.delete(1.0, tk.END)
+        if self.status_text is not None:
+            self.status_text.delete(1.0, tk.END)
         self.log_status("[TEST] Testing subprocess output capture...")
         
         # Run in a separate thread
@@ -1156,7 +2910,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
     
     def open_music_folder(self):
         """Open the included music folder in Windows Explorer and refresh dropdown"""
-        music_path = os.path.join(os.path.dirname(__file__), "Music")
+        music_path = self.get_music_dir()
         if os.path.exists(music_path):
             try:
                 os.startfile(music_path)
@@ -1169,7 +2923,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
     
     def open_intro_folder(self):
         """Open the included intro videos folder in Windows Explorer and refresh dropdown"""
-        intro_path = os.path.join(os.path.dirname(__file__), "Intros")
+        intro_path = self.get_intro_dir()
         if os.path.exists(intro_path):
             try:
                 os.startfile(intro_path)
@@ -1223,7 +2977,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 else:
                     self.intro_selection_var.set(intro_options[0] if intro_options else 'StockDefault')
                 
-                self.log_status(f"[OK] Intro list refreshed - {len(intro_options)} videos available")
+                self.log_status(f"[OK] Intro list refreshed - {len(intro_options)} intro media files available")
         except Exception as e:
             self.log_error(f"Failed to refresh intro list: {e}")
             messagebox.showerror("Error", f"Could not refresh intro list:\n{e}")
@@ -1238,10 +2992,10 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
     def get_music_file_set(self):
         """Get set of music filenames for comparison"""
         try:
-            music_dir = os.path.join(os.path.dirname(__file__), "Music")
+            music_dir = self.get_music_dir()
             if os.path.exists(music_dir):
                 return set(f for f in os.listdir(music_dir) 
-                          if f.lower().endswith(('.mp3', '.wav', '.m4a', '.flac')))
+                          if f.lower().endswith(self.MUSIC_EXTENSIONS))
         except Exception:
             pass
         return set()
@@ -1249,10 +3003,10 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
     def get_intro_file_set(self):
         """Get set of intro filenames for comparison"""
         try:
-            intro_dir = os.path.join(os.path.dirname(__file__), "Intros")
+            intro_dir = self.get_intro_dir()
             if os.path.exists(intro_dir):
                 return set(f for f in os.listdir(intro_dir) 
-                          if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')))
+                          if f.lower().endswith(self.INTRO_EXTENSIONS))
         except Exception:
             pass
         return set()
@@ -1328,6 +3082,10 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             safe_message = safe_message.encode('ascii', errors='replace').decode('ascii')
         
         log_message = f"[{timestamp}] {safe_message}\n"
+
+        if self.status_text is None:
+            print(log_message.rstrip())
+            return
         
         try:
             # Ensure widget is normal state and insert text
@@ -1381,7 +3139,9 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 "output_path": getattr(self, 'output_path_var', tk.StringVar()).get(),
                 "trim_seconds": getattr(self, 'trim_seconds_var', tk.StringVar()).get(),
                 "music_selection": getattr(self, 'music_selection_var', tk.StringVar()).get(),
-                "intro_selection": getattr(self, 'intro_selection_var', tk.StringVar()).get()
+                "intro_selection": getattr(self, 'intro_selection_var', tk.StringVar()).get(),
+                "clip_order": getattr(self, 'clip_order_var', tk.StringVar(value="newest_first")).get(),
+                "clip_timeframe": getattr(self, 'clip_timeframe_var', tk.StringVar(value="1_week")).get()
                 # Resolution auto-detected - no GUI config needed
             }
             
@@ -1397,20 +3157,54 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         if hasattr(self, 'output_path_var'):
             self.output_path_var.set(self.config.get("output_path", os.path.expanduser("~/Downloads")))
         if hasattr(self, 'trim_seconds_var'):
-            self.trim_seconds_var.set(self.config.get("trim_seconds", "10"))
+            self.trim_seconds_var.set(self.config.get("trim_seconds") or "15")
         if hasattr(self, 'music_selection_var'):
-            self.music_selection_var.set(self.config.get("music_selection", ""))
+            self.music_selection_var.set(self.config.get("music_selection") or "None")
         if hasattr(self, 'intro_selection_var'):
-            self.intro_selection_var.set(self.config.get("intro_selection", ""))
+            self.intro_selection_var.set(self.config.get("intro_selection") or "None")
+        if hasattr(self, 'clip_order_var'):
+            self.clip_order_var.set(self.config.get("clip_order", "newest_first"))
+        if hasattr(self, 'clip_timeframe_var'):
+            self.clip_timeframe_var.set(self.config.get("clip_timeframe", "1_week"))
         # Resolution auto-detected by main script - no GUI config needed
+        if hasattr(self, 'music_combo'):
+            self.refresh_music_list()
+        if hasattr(self, 'intro_combo'):
+            self.refresh_intro_list()
+        if hasattr(self, 'clip_selection_canvas'):
+            self.refresh_clip_selection_panel(preserve_saved=True, save_snapshot=False)
         self.update_paths_display()
     
     def center_window(self):
-        """Center the window on screen"""
+        """Open the main window large and centered without forcing full-screen."""
         self.root.update_idletasks()
-        x = (self.root.winfo_screenwidth() // 2) - (self.root.winfo_width() // 2)
-        y = (self.root.winfo_screenheight() // 2) - (self.root.winfo_height() // 2)
-        self.root.geometry(f"+{x}+{y}")
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        width = min(max(1280, int(screen_width * 0.82)), max(1280, screen_width - 120))
+        height = min(max(900, int(screen_height * 0.84)), max(900, screen_height - 140))
+        x = max(0, (self.root.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.root.winfo_screenheight() - height) // 2)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def position_child_window(self, window, width=None, height=None, modal=False):
+        """Center a child window over the main control panel."""
+        self.root.update_idletasks()
+        window.transient(self.root)
+
+        if width is None or height is None:
+            window.update_idletasks()
+            width = width or window.winfo_reqwidth()
+            height = height or window.winfo_reqheight()
+
+        width = int(width)
+        height = int(height)
+        x = self.root.winfo_x() + max(20, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_y() + max(20, (self.root.winfo_height() - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        window.lift(self.root)
+        window.focus_force()
+        if modal:
+            window.grab_set()
     
     # Donation system methods
     def open_venmo(self):
@@ -1423,7 +3217,6 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             # Show detailed instructions with multiple options
             instruction_window = tk.Toplevel(self.root)
             instruction_window.title("Venmo Donation Instructions")
-            instruction_window.geometry("450x300")
             instruction_window.resizable(False, False)
             instruction_window.configure(bg='white')
             
@@ -1435,23 +3228,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             except:
                 pass
             
-            # Center the window on the parent GUI
-            instruction_window.transient(self.root)
-            instruction_window.grab_set()
-            
-            # Calculate center position
-            self.root.update_idletasks()
-            main_x = self.root.winfo_x()
-            main_y = self.root.winfo_y()
-            main_width = self.root.winfo_width()
-            main_height = self.root.winfo_height()
-            
-            window_width = 450
-            window_height = 300
-            center_x = main_x + (main_width - window_width) // 2
-            center_y = main_y + (main_height - window_height) // 2
-            
-            instruction_window.geometry(f"{window_width}x{window_height}+{center_x}+{center_y}")
+            self.position_child_window(instruction_window, width=450, height=300, modal=True)
             
             # Header
             header_label = tk.Label(instruction_window, text="[CARD] Venmo Donation", 
@@ -1548,7 +3325,6 @@ To send a donation:
             # Create QR code window
             qr_window = tk.Toplevel(self.root)
             qr_window.title(f"{crypto_name} Donation Address")
-            qr_window.geometry("450x550")
             qr_window.resizable(False, False)
             qr_window.configure(bg='white')
             
@@ -1560,25 +3336,7 @@ To send a donation:
             except:
                 pass
             
-            # Center the window on the parent GUI
-            qr_window.transient(self.root)
-            qr_window.grab_set()
-            
-            # Calculate position to center on main window
-            self.root.update_idletasks()  # Ensure main window geometry is updated
-            main_x = self.root.winfo_x()
-            main_y = self.root.winfo_y()
-            main_width = self.root.winfo_width()
-            main_height = self.root.winfo_height()
-            
-            qr_width = 450
-            qr_height = 550
-            
-            # Center position calculation
-            center_x = main_x + (main_width - qr_width) // 2
-            center_y = main_y + (main_height - qr_height) // 2
-            
-            qr_window.geometry(f"{qr_width}x{qr_height}+{center_x}+{center_y}")
+            self.position_child_window(qr_window, width=450, height=550, modal=True)
             
             # Generate QR code with crypto URI scheme
             qr = qrcode.QRCode(version=1, box_size=8, border=4)

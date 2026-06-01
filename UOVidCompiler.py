@@ -21,6 +21,7 @@ import subprocess
 import random
 import glob
 import shutil
+import shlex
 import tempfile
 import logging
 import sys
@@ -109,6 +110,11 @@ trim_value = os.environ.get('TRIM_SECONDS', '15')
 TRIM_SECONDS = int(trim_value) if trim_value != 'None' else None  # None means use full video length
 MUSIC_SELECTION = os.environ.get('MUSIC_SELECTION', '')  # 'None' means no music
 INTRO_SELECTION = os.environ.get('INTRO_SELECTION', '')  # 'None' means no intro
+CLIP_ORDER = os.environ.get('CLIP_ORDER', 'newest_first')
+CUSTOM_ORDER_FILE = os.environ.get('CUSTOM_ORDER_FILE', '')
+CLIP_TIMEFRAME = os.environ.get('CLIP_TIMEFRAME', '1_week')
+MUSIC_FOLDER = os.environ.get('MUSIC_FOLDER', os.path.join(os.path.dirname(__file__), "Music"))
+INTRO_FOLDER = os.environ.get('INTRO_FOLDER', os.path.join(os.path.dirname(__file__), "Intros"))
 # Resolution automatically detected - no GUI option needed for universal compatibility
 
 CONFIG = {
@@ -116,18 +122,21 @@ CONFIG = {
     "video_folder": VIDEO_INPUT_PATH,
     
     # Music folder (background music for compilations) - Using included music
-    "music_folder": os.path.join(os.path.dirname(__file__), "Music"),
+    "music_folder": MUSIC_FOLDER,
     
     # Output folder (where compiled videos will be saved)
     "output_folder": VIDEO_OUTPUT_PATH,
     
     # Intro folder (optional intro videos) - Using included intros
-    "intro_folder": os.path.join(os.path.dirname(__file__), "Intros"),
+    "intro_folder": INTRO_FOLDER,
     
     # Video configuration
     "trim_seconds": TRIM_SECONDS,
     "music_selection": MUSIC_SELECTION,
     "intro_selection": INTRO_SELECTION,
+    "clip_order": CLIP_ORDER,
+    "custom_order_file": CUSTOM_ORDER_FILE,
+    "clip_timeframe": CLIP_TIMEFRAME,
     
     # Output filename (will be timestamped automatically)
     "output_filename": "BMagic_Compilation.mp4",
@@ -138,8 +147,9 @@ CONFIG = {
     
     # Video settings
     "clip_duration": float(TRIM_SECONDS) if TRIM_SECONDS else 999999.0,  # Use full length if None selected
-    "video_extensions": [".mp4", ".avi", ".mov", ".mkv"],
-    "music_extensions": [".mp3", ".wav", ".m4a", ".ogg"],
+    "video_extensions": [".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"],
+    "intro_extensions": [".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".gif"],
+    "music_extensions": [".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac"],
     
     # Quality settings (Using S+ working resolution)
     "output_resolution": "2560x1056",  # S+ working resolution for wide compilations
@@ -148,6 +158,26 @@ CONFIG = {
     "audio_bitrate": "192k"
 }
 # ===== END CONFIGURATION SECTION =====
+
+def report_progress(percent, message):
+    """Send coarse progress updates to the GUI when available."""
+    callback = CONFIG.get("progress_callback")
+    if callable(callback):
+        try:
+            callback(float(percent), str(message))
+        except Exception:
+            pass
+
+
+def cancellation_requested():
+    """Return True when the GUI requested cancellation."""
+    callback = CONFIG.get("cancel_callback")
+    if callable(callback):
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+    return False
 
 def setup_check():
     """Enhanced setup validation with detailed feedback"""
@@ -202,8 +232,8 @@ def setup_check():
     # Check intro folder
     if CONFIG["use_intro"]:
         intro_files = [f for f in os.listdir(CONFIG["intro_folder"]) 
-                      if f.lower().endswith(('.mp4', '.mov', '.avi'))]
-        safe_print(f"[VIDEO] Intro videos available: {len(intro_files)}")
+                      if any(f.lower().endswith(ext) for ext in CONFIG["intro_extensions"])]
+        safe_print(f"[VIDEO] Intro media files available: {len(intro_files)}")
     
     # Create output folder if it doesn't exist
     if not os.path.exists(CONFIG["output_folder"]):
@@ -271,11 +301,68 @@ def auto_detect_paths():
     
     return None
 
+def terminate_process_tree(process):
+    """Terminate an FFmpeg shell wrapper and any child process it spawned."""
+    if not process or process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        else:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
 def run_ffmpeg_command(command, timeout=60):
     """Run an FFmpeg command and return the result with timeout"""
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True, timeout=timeout)
-        return True, result.stdout, result.stderr
+        if cancellation_requested():
+            return False, "", "Cancelled by user"
+        popen_command = shlex.split(command) if os.name == "nt" and isinstance(command, str) else command
+        process = subprocess.Popen(
+            popen_command,
+            shell=os.name != "nt",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+        deadline = time.time() + timeout if timeout else None
+        while True:
+            if cancellation_requested():
+                terminate_process_tree(process)
+                return False, "", "Cancelled by user"
+            if deadline and time.time() >= deadline:
+                terminate_process_tree(process)
+                try:
+                    process.communicate(timeout=5)
+                except Exception:
+                    pass
+                return False, "", f"FFmpeg command timed out after {timeout} seconds"
+            try:
+                communicate_timeout = 0.25
+                if deadline:
+                    communicate_timeout = max(0.05, min(0.25, deadline - time.time()))
+                stdout, stderr = process.communicate(timeout=communicate_timeout)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if process.returncode != 0:
+            return False, stdout, stderr
+        return True, stdout, stderr
     except subprocess.TimeoutExpired:
         return False, "", f"FFmpeg command timed out after {timeout} seconds"
     except subprocess.CalledProcessError as e:
@@ -516,6 +603,8 @@ def calculate_smart_clips(video_files, clip_duration):
     
     smart_clips = []
     last_clip_end_in_footage = 0  # Track when the EXTRACTED CLIP ends in the actual footage timeline
+    clip_settings = _load_clip_settings()
+    requested_total_duration = 0.0
     
     for i, (video_path, creation_timestamp) in enumerate(video_data):
         # Get video duration
@@ -523,6 +612,9 @@ def calculate_smart_clips(video_files, clip_duration):
         if total_duration is None or total_duration <= 0:
             logger.warning(f"Skipping {video_path} - cannot determine duration")
             continue
+
+        requested_clip_duration = _get_clip_duration_for_path(video_path, clip_duration, clip_settings)
+        requested_total_duration += min(total_duration, requested_clip_duration)
         
         # For buffered recording: footage timeline is BEFORE file creation
         # Actual footage spans: (creation_timestamp - total_duration) to creation_timestamp
@@ -530,12 +622,12 @@ def calculate_smart_clips(video_files, clip_duration):
         footage_end_timestamp = creation_timestamp
         
         # Determine what to extract (last N seconds)
-        if total_duration <= clip_duration:
+        if total_duration <= requested_clip_duration:
             start_time = 0
             extract_duration = total_duration
         else:
-            start_time = total_duration - clip_duration  # Extract LAST clip_duration seconds
-            extract_duration = clip_duration
+            start_time = total_duration - requested_clip_duration  # Extract LAST requested clip seconds
+            extract_duration = requested_clip_duration
         
         # Calculate when this extracted clip exists in the footage timeline
         clip_start_in_footage = footage_start_timestamp + start_time
@@ -578,7 +670,7 @@ def calculate_smart_clips(video_files, clip_duration):
             
             # Calculate remaining duration after skipping overlap
             remaining_duration = total_duration - new_start_time
-            new_extract_duration = min(clip_duration - overlap_duration, remaining_duration)
+            new_extract_duration = min(requested_clip_duration - overlap_duration, remaining_duration)
             
             if new_extract_duration <= 0.5:
                 # Too short after removing overlap - skip it
@@ -598,26 +690,148 @@ def calculate_smart_clips(video_files, clip_duration):
             smart_clips.append((video_path, start_time, extract_duration, creation_timestamp))
             last_clip_end_in_footage = clip_end_in_footage
     
-    # Reverse to maintain newest-first order for final compilation (as user expects)
-    smart_clips.reverse()
+    smart_clips = order_smart_clips_for_output(smart_clips)
     
     # Enhanced logging summary for validation
     logger.info(f"Smart clip calculation complete: {len(smart_clips)} clips from {len(video_files)} videos")
     safe_print(f"\n[SUMMARY] SMART CLIP SUMMARY:")
-    total_original_duration = len(video_files) * clip_duration
+    total_original_duration = requested_total_duration
     total_smart_duration = sum(clip[2] for clip in smart_clips)
     overlap_time_saved = total_original_duration - total_smart_duration
     
-    safe_print(f"   [STATS] Original duration (dumb): {total_original_duration:.1f}s ({len(video_files)} x {clip_duration}s)")
+    safe_print(f"   [STATS] Requested duration (pre-overlap): {total_original_duration:.1f}s")
     safe_print(f"   [SMART] Smart duration (no overlap): {total_smart_duration:.1f}s")
     safe_print(f"   [TIME] Overlap time eliminated: {overlap_time_saved:.1f}s")
-    safe_print(f"   [TARGET] Efficiency gain: {(overlap_time_saved/total_original_duration*100):.1f}%")
+    efficiency_gain = (overlap_time_saved / total_original_duration * 100) if total_original_duration > 0 else 0
+    safe_print(f"   [TARGET] Efficiency gain: {efficiency_gain:.1f}%")
     
     for i, (video_path, start_time, extract_duration, timestamp) in enumerate(smart_clips):
         creation_time = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
         safe_print(f"   [{i+1}] {os.path.basename(video_path)[:30]:30} | {creation_time} | {start_time:6.2f}s->{start_time+extract_duration:6.2f}s ({extract_duration:5.2f}s)")
     
     return smart_clips
+
+
+def _load_custom_order_map():
+    order_file = str(CONFIG.get("custom_order_file", "") or "").strip()
+    if not order_file or not os.path.exists(order_file):
+        return {}
+    try:
+        with open(order_file, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        paths = data.get("paths", data if isinstance(data, list) else [])
+        return {os.path.normcase(os.path.abspath(path)): index for index, path in enumerate(paths)}
+    except Exception as e:
+        logger.warning(f"Could not load custom order file: {e}")
+        return {}
+
+
+def _load_selected_clip_paths():
+    order_file = str(CONFIG.get("custom_order_file", "") or "").strip()
+    if not order_file or not os.path.exists(order_file):
+        return []
+    try:
+        with open(order_file, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            paths = data.get("paths", [])
+        elif isinstance(data, list):
+            paths = data
+        else:
+            paths = []
+        normalized_paths = []
+        for path in paths:
+            if not path:
+                continue
+            normalized_paths.append(os.path.normcase(os.path.abspath(path)))
+        return normalized_paths
+    except Exception as e:
+        logger.warning(f"Could not load selected clip paths: {e}")
+        return []
+
+
+def _load_clip_settings():
+    order_file = str(CONFIG.get("custom_order_file", "") or "").strip()
+    if not order_file or not os.path.exists(order_file):
+        return {}
+    try:
+        with open(order_file, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        clip_settings = data.get("clip_settings", {}) if isinstance(data, dict) else {}
+        normalized_settings = {}
+        if isinstance(clip_settings, dict):
+            for path, settings in clip_settings.items():
+                if not path:
+                    continue
+                normalized_settings[os.path.normcase(os.path.abspath(path))] = settings if isinstance(settings, dict) else {"trim_seconds": settings}
+        return normalized_settings
+    except Exception as e:
+        logger.warning(f"Could not load clip settings: {e}")
+        return {}
+
+
+def _get_clip_duration_for_path(video_path, default_duration, clip_settings=None):
+    if clip_settings is None:
+        clip_settings = _load_clip_settings()
+    settings = clip_settings.get(os.path.normcase(os.path.abspath(video_path)), {})
+    trim_seconds = settings.get("trim_seconds") if isinstance(settings, dict) else None
+    try:
+        requested_duration = float(trim_seconds)
+        if requested_duration > 0:
+            return requested_duration
+    except (TypeError, ValueError):
+        pass
+    return default_duration
+
+
+def _timeframe_seconds(value):
+    lookup = {
+        "1_day": 24 * 60 * 60,
+        "1_week": 7 * 24 * 60 * 60,
+        "2_weeks": 14 * 24 * 60 * 60,
+        "1_month": 30 * 24 * 60 * 60,
+        "all": None,
+        "": None,
+    }
+    return lookup.get(str(value or "").strip().lower())
+
+
+def filter_video_files_by_timeframe(video_files):
+    timeframe_value = str(CONFIG.get("clip_timeframe", "1_week") or "1_week").lower()
+    cutoff_seconds = _timeframe_seconds(timeframe_value)
+    if cutoff_seconds is None:
+        return list(video_files)
+    cutoff = time.time() - cutoff_seconds
+    filtered = []
+    for path in video_files:
+        try:
+            if os.path.getmtime(path) >= cutoff:
+                filtered.append(path)
+        except OSError:
+            continue
+    return filtered
+
+
+def order_smart_clips_for_output(smart_clips):
+    """Order calculated, de-overlapped clips for the final compilation."""
+    order_mode = str(CONFIG.get("clip_order", "newest_first") or "newest_first").lower()
+    if order_mode == "oldest_first":
+        return sorted(smart_clips, key=lambda clip: clip[3])
+    if order_mode == "filename_az":
+        return sorted(smart_clips, key=lambda clip: os.path.basename(clip[0]).lower())
+    if order_mode == "filename_za":
+        return sorted(smart_clips, key=lambda clip: os.path.basename(clip[0]).lower(), reverse=True)
+    if order_mode == "custom":
+        custom_order = _load_custom_order_map()
+        if custom_order:
+            return sorted(
+                smart_clips,
+                key=lambda clip: (
+                    custom_order.get(os.path.normcase(os.path.abspath(clip[0])), 999999),
+                    clip[3],
+                ),
+            )
+    return sorted(smart_clips, key=lambda clip: clip[3], reverse=True)
 
 
 def standardize_clip(input_path, output_path):
@@ -644,9 +858,34 @@ def get_video_files(folder):
         pattern = os.path.join(folder, f"*{ext}")
         import glob
         video_files.extend(glob.glob(pattern))
+
+    video_files = filter_video_files_by_timeframe(video_files)
+
+    selected_paths = _load_selected_clip_paths()
+    if selected_paths:
+        selected_set = set(selected_paths)
+        video_files = [path for path in video_files if os.path.normcase(os.path.abspath(path)) in selected_set]
     
-    # Sort by modification time (newest first)
-    video_files.sort(key=os.path.getmtime, reverse=True)
+    order_mode = str(CONFIG.get("clip_order", "newest_first") or "newest_first").lower()
+    if order_mode == "oldest_first":
+        video_files.sort(key=os.path.getmtime)
+    elif order_mode == "filename_az":
+        video_files.sort(key=lambda path: os.path.basename(path).lower())
+    elif order_mode == "filename_za":
+        video_files.sort(key=lambda path: os.path.basename(path).lower(), reverse=True)
+    elif order_mode == "custom":
+        custom_order = _load_custom_order_map()
+        if custom_order:
+            video_files.sort(
+                key=lambda path: (
+                    custom_order.get(os.path.normcase(os.path.abspath(path)), 999999),
+                    os.path.getmtime(path),
+                )
+            )
+        else:
+            video_files.sort(key=os.path.getmtime, reverse=True)
+    else:
+        video_files.sort(key=os.path.getmtime, reverse=True)
     return video_files
 
 def generate_unique_filename(base_name="BMagic_Compilation", extension=".mp4"):
@@ -660,7 +899,11 @@ def select_random_intro():
     if not CONFIG["use_intro"] or not os.path.exists(CONFIG["intro_folder"]):
         return None
     
-    intro_files = get_video_files(CONFIG["intro_folder"])
+    intro_files = []
+    for ext in CONFIG["intro_extensions"]:
+        pattern = os.path.join(CONFIG["intro_folder"], f"*{ext}")
+        import glob
+        intro_files.extend(glob.glob(pattern))
     
     if not intro_files:
         return None
@@ -926,12 +1169,14 @@ def main():
     """Enhanced main execution function with progress tracking"""
     start_time = time.time()
     success = False  # Initialize success flag
+    report_progress(2, "Starting")
     
     safe_print("\n[GAME] Starting B-Magic's Auto Vid Compiler...")
     logger.info("Starting video compilation process")
     
     # Enhanced setup check
     if not setup_check():
+        report_progress(0, "Setup incomplete")
         safe_print("\n[STOP] Setup incomplete. Please fix the issues above and run again.")
         logger.error("Setup validation failed, aborting compilation")
         if not os.environ.get('GUI_MODE'):
@@ -939,6 +1184,7 @@ def main():
         return False
     
     # Smart resolution detection for universal compatibility
+    report_progress(5, "Detecting output resolution")
     safe_print("\n[TARGET] Configuring optimal video resolution...")
     
     # Always use smart auto-detection for universal compatibility
@@ -976,12 +1222,13 @@ def main():
     logger.info(f"Output directory ready: {CONFIG['output_folder']}")
     
     # Get video files with enhanced feedback
+    report_progress(8, "Scanning source folder")
     safe_print("\n[SEARCH] Scanning for video files...")
     video_files = get_video_files(CONFIG["video_folder"])
     
     if not video_files:
         safe_print(f"\n[ERROR] No video files found in {CONFIG['video_folder']}")
-        safe_print(f"[SUMMARY] Supported formats: {', '.join(CONFIG['video_extensions'])}")
+        safe_print(f"[SUMMARY] Supported video formats: {', '.join(CONFIG['video_extensions'])}")
         safe_print("[TIP] Make sure your recordings are in the correct folder!")
         logger.error(f"No video files found in {CONFIG['video_folder']}")
         if not os.environ.get('GUI_MODE'):
@@ -993,7 +1240,7 @@ def main():
     
     # Show most recent files
     if len(video_files) > 0:
-        safe_print("\n[FOLDER] Most recent video files:")
+        safe_print(f"\n[FOLDER] Video files in output order ({CONFIG.get('clip_order', 'newest_first')}):")
         for i, video_file in enumerate(video_files[:5]):
             file_size = os.path.getsize(video_file) / (1024*1024)  # MB
             mod_time = datetime.fromtimestamp(os.path.getmtime(video_file))
@@ -1009,6 +1256,7 @@ def main():
             safe_print(f"\n[CELEBRATE] Video compilation completed successfully!")
             safe_print(f"[TIME] Total time: {duration:.1f} seconds")
             safe_print(f"[FOLDER] Output saved to: {result}")  # result contains the full output path
+            report_progress(100, "Compilation complete")
             logger.info(f"Compilation completed successfully in {duration:.1f} seconds")
             
             # Open output folder
@@ -1092,7 +1340,7 @@ def select_intro_video():
         print(f"DEBUG: Searching for intro: '{intro_name}'")
         print(f"DEBUG: Looking in folder: {CONFIG['intro_folder']}")
         
-        for ext in CONFIG["video_extensions"]:
+        for ext in CONFIG["intro_extensions"]:
             intro_file = os.path.join(CONFIG["intro_folder"], f"{intro_name}{ext}")
             print(f"DEBUG: Checking: {intro_file}")
             if os.path.exists(intro_file):
@@ -1106,7 +1354,7 @@ def select_intro_video():
     
     # Fall back to random selection if no specific choice or file not found
     intro_files = []
-    for ext in CONFIG["video_extensions"]:
+    for ext in CONFIG["intro_extensions"]:
         pattern = os.path.join(CONFIG["intro_folder"], f"*{ext}")
         intro_files.extend(glob.glob(pattern))
     
@@ -1134,6 +1382,7 @@ def create_compilation_video(video_files):
     
     safe_print(f"[VIDEO] Processing {len(video_files)} video files with smart overlap detection...")
     logger.info(f"Starting smart compilation of {len(video_files)} videos")
+    report_progress(10, "Analyzing clips")
     
     # Step 1: Calculate smart clips to avoid overlapping content
     safe_print("\n[SMART] Step 1: Analyzing video timestamps and calculating smart clips...")
@@ -1153,6 +1402,10 @@ def create_compilation_video(video_files):
     total_actual_duration = 0
     
     for i, (video_file, start_time, extract_duration, creation_timestamp) in enumerate(smart_clips):
+        if cancellation_requested():
+            safe_print("\n[STOP] Compilation cancelled by user")
+            return False
+        report_progress(15 + (50 * (i / max(1, len(smart_clips)))), f"Extracting clip {i+1}/{len(smart_clips)}")
         # Check file size to avoid processing extremely large files
         file_size_mb = os.path.getsize(video_file) / (1024 * 1024)
         safe_print(f"   [{i+1}/{len(smart_clips)}] Smart clip: {os.path.basename(video_file)} ({file_size_mb:.1f}MB)")
@@ -1187,6 +1440,7 @@ def create_compilation_video(video_files):
         logger.error("No clips extracted from any videos")
         return False
     
+    report_progress(68, "Building music playlist")
     safe_print(f"\n[OK] Successfully processed {len(processed_videos)} smart clips")
     safe_print(f"[STATS] Total compilation duration: {total_actual_duration:.1f}s (avg: {total_actual_duration/len(processed_videos):.1f}s per clip)")
     
@@ -1199,7 +1453,7 @@ def create_compilation_video(video_files):
     safe_print("\n[MUSIC] Step 2: Creating background music playlist...")
     temp_dir = tempfile.gettempdir()
     # Skip music if user selected "None"
-    if MUSIC_SELECTION == "None":
+    if CONFIG.get("music_selection") == "None":
         music_playlist = None
         safe_print("   [MUSIC] Music disabled (None selected)")
     else:
@@ -1215,16 +1469,10 @@ def create_compilation_video(video_files):
         logger.warning("No background music found")
         music_playlist = None
     
-    safe_print(f"\n[DEBUG] DEBUG: Music playlist creation completed!")
-    safe_print(f"[DEBUG] DEBUG: Music playlist path: {music_playlist}")
-    
-    # Debug: Check what happens after music playlist creation
-    safe_print(f"\n[DEBUG] DEBUG: About to check intro configuration...")
-    safe_print(f"   CONFIG['use_intro'] = {CONFIG.get('use_intro', 'NOT_SET')}")
-    
     # Step 3: Select intro (if enabled) 
     intro_clip_path = None
     if CONFIG["use_intro"]:
+        report_progress(76, "Processing intro")
         safe_print("\n[VIDEO] Step 3: Selecting intro video...")
         intro_file = select_intro_video()
         if intro_file:
@@ -1255,6 +1503,7 @@ def create_compilation_video(video_files):
         safe_print(f"   [VIDEO] Added intro to start of compilation")
     
     # Step 5: Final compilation
+    report_progress(86, "Creating final compilation")
     safe_print(f"\n[TOOLS] Step 5: Creating final compilation...")
     unique_filename = generate_unique_filename(CONFIG["output_filename"])
     output_path = os.path.join(CONFIG["output_folder"], unique_filename)
@@ -1266,70 +1515,27 @@ def create_compilation_video(video_files):
         if success and os.path.exists(output_path):
             # Show final file info
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            safe_print(f"   ✅ Final video created successfully!")
-            safe_print(f"   📁 File: {os.path.basename(output_path)}")
-            safe_print(f"   📊 Size: {size_mb:.1f} MB")
+            safe_print("   [OK] Final video created successfully!")
+            safe_print(f"   [FILE] {os.path.basename(output_path)}")
+            safe_print(f"   [SIZE] {size_mb:.1f} MB")
             logger.info(f"Compilation successful: {output_path} ({size_mb:.1f}MB)")
+            report_progress(100, "Compilation complete")
             
             return output_path  # Return the actual output path on success
         else:
-            safe_print("   ❌ Failed to create final compilation")
+            safe_print("   [ERROR] Failed to create final compilation")
             logger.error("Final concatenation failed")
             return False
             
     except Exception as e:
-        safe_print(f"   ❌ Error during final compilation: {e}")
+        safe_print(f"   [ERROR] Error during final compilation: {e}")
         logger.error(f"Error during concatenation: {e}")
         return False
     finally:
         # Cleanup temporary files
-        safe_print("\n🧹 Cleaning up temporary files...")
+        safe_print("\n[CLEANUP] Cleaning up temporary files...")
         cleanup_temp_files(processed_videos)
         logger.info("Temporary files cleaned up")
-        safe_print("\n[VIDEO] Step 3: Selecting intro video...")
-        intro_file = select_random_intro()
-        if intro_file:
-            safe_print(f"   [INTRO] Selected: {os.path.basename(intro_file)}")
-            logger.info(f"Selected intro video: {intro_file}")
-        else:
-            safe_print("   [WARNING] No intro videos available")
-            logger.warning("No intro videos found")
-    
-    # Step 4: Final compilation
-    safe_print(f"\n[TOOLS] Step 4: Creating final compilation...")
-    unique_filename = generate_unique_filename(CONFIG["output_filename"])
-    output_path = os.path.join(CONFIG["output_folder"], unique_filename)
-    
-    try:
-        # Use the existing concatenate_videos function (it takes 3 parameters)
-        success = concatenate_videos(processed_videos, output_path, music_playlist)
-        
-        if success and os.path.exists(output_path):
-            # Show final file info
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            safe_print(f"   ✅ Final video created successfully!")
-            safe_print(f"   📁 File: {os.path.basename(output_path)}")
-            safe_print(f"   📊 Size: {size_mb:.1f} MB")
-            logger.info(f"Compilation successful: {output_path} ({size_mb:.1f}MB)")
-            
-            return output_path  # Return the actual output path on success
-        else:
-            safe_print("   ❌ Failed to create final compilation")
-            logger.error("Final concatenation failed")
-            return False
-            
-    except Exception as e:
-        safe_print(f"   ❌ Error during final compilation: {e}")
-        logger.error(f"Error during concatenation: {e}")
-        return False
-    finally:
-        # Cleanup temporary files
-        safe_print("\n🧹 Cleaning up temporary files...")
-        cleanup_temp_files(processed_videos)
-        logger.info("Temporary files cleaned up")
-        if not os.environ.get('GUI_MODE'):
-            input("Press Enter to exit...")
-        return
     
 if __name__ == "__main__":
     import sys
