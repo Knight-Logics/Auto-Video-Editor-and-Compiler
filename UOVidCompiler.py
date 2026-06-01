@@ -31,31 +31,102 @@ from datetime import datetime
 
 # Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(__file__)
+APP_RUNTIME_ROOT = os.environ.get("AUTOVID_STORAGE_DIR", "").strip()
+LOG_FILE_PATH = ""
+
+
+def get_runtime_root():
+    if APP_RUNTIME_ROOT:
+        path = APP_RUNTIME_ROOT
+    elif getattr(sys, 'frozen', False):
+        root = os.environ.get("APPDATA") or os.environ.get("PROGRAMDATA") or os.path.expanduser("~")
+        path = os.path.join(root, "KnightLogics", "AutoVidCompiler")
+    else:
+        path = SCRIPT_DIR
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def get_logs_dir(log_dir=None):
+    resolved = str(log_dir or os.environ.get("AUTOVID_LOG_DIR", "") or "").strip()
+    if not resolved:
+        resolved = os.path.join(get_runtime_root(), "logs")
+    os.makedirs(resolved, exist_ok=True)
+    return resolved
+
+
+def get_log_file_path():
+    return LOG_FILE_PATH
+
+
+def _resolve_log_level(log_level=None):
+    level_name = str(log_level or os.environ.get("AUTOVID_LOG_LEVEL", "DEBUG") or "DEBUG").upper()
+    return getattr(logging, level_name, logging.DEBUG)
+
+
+def _get_console_stream():
+    for candidate in (getattr(sys, "stdout", None), getattr(sys, "__stdout__", None)):
+        if candidate is not None and hasattr(candidate, "write"):
+            return candidate
+    return None
 
 # Set up enhanced logging
-def setup_logging():
+def setup_logging(log_dir=None, log_level=None):
     """Set up logging with both file and console output"""
-    
-    # Create logs directory if it doesn't exist
-    logs_dir = os.path.join(SCRIPT_DIR, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    
-    # Create log filename with timestamp
+
+    logs_dir = get_logs_dir(log_dir)
     log_filename = f"bmagic_autovidcompiler_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_file = os.path.join(logs_dir, log_filename)
-    
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)
-        ]
+
+    app_logger = logging.getLogger("KnightLogics.AutoVidCompiler")
+    app_logger.setLevel(_resolve_log_level(log_level))
+    app_logger.propagate = False
+
+    for handler in list(app_logger.handlers):
+        app_logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(app_logger.level)
+    file_handler.setFormatter(formatter)
+    app_logger.addHandler(file_handler)
+
+    console_stream = _get_console_stream()
+    if console_stream is not None:
+        console_handler = logging.StreamHandler(console_stream)
+        console_handler.setLevel(app_logger.level)
+        console_handler.setFormatter(formatter)
+        app_logger.addHandler(console_handler)
+
+    global LOG_FILE_PATH
+    LOG_FILE_PATH = log_file
+
+    app_logger.info(f"B-Magic's Auto Vid Compiler started - Log file: {log_file}")
+    app_logger.debug(
+        "Logging context: frozen=%s runtime_root=%s script_dir=%s cwd=%s python=%s gui_mode=%s",
+        getattr(sys, 'frozen', False),
+        get_runtime_root(),
+        SCRIPT_DIR,
+        os.getcwd(),
+        sys.executable,
+        os.environ.get('GUI_MODE', ''),
     )
-    
-    logger = logging.getLogger(__name__)
-    logger.info(f"B-Magic's Auto Vid Compiler started - Log file: {log_file}")
+    return app_logger
+
+
+def configure_logging(log_dir=None, log_level=None):
+    if log_dir:
+        os.environ["AUTOVID_LOG_DIR"] = str(log_dir)
+    if log_level:
+        os.environ["AUTOVID_LOG_LEVEL"] = str(log_level).upper()
+
+    global logger
+    logger = setup_logging(log_dir=log_dir, log_level=log_level)
     return logger
 
 # Initialize logging
@@ -1173,6 +1244,17 @@ def main():
     
     safe_print("\n[GAME] Starting B-Magic's Auto Vid Compiler...")
     logger.info("Starting video compilation process")
+    logger.debug(
+        "Runtime snapshot: ffmpeg=%s ffprobe=%s input=%s output=%s music=%s intro=%s clip_order=%s clip_timeframe=%s",
+        FFMPEG_PATH,
+        FFPROBE_PATH,
+        CONFIG.get("video_folder", ""),
+        CONFIG.get("output_folder", ""),
+        CONFIG.get("music_selection", ""),
+        CONFIG.get("intro_selection", ""),
+        CONFIG.get("clip_order", ""),
+        CONFIG.get("clip_timeframe", ""),
+    )
     
     # Enhanced setup check
     if not setup_check():
@@ -1539,5 +1621,10 @@ def create_compilation_video(video_files):
     
 if __name__ == "__main__":
     import sys
-    success = main()
+    try:
+        success = main()
+    except Exception:
+        logger.exception("Unhandled fatal compiler exception")
+        safe_print("[ERROR] Unhandled fatal error. Check the logs folder for details.")
+        success = False
     sys.exit(0 if success else 1)

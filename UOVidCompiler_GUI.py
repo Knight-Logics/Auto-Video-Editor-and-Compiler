@@ -21,7 +21,11 @@ import subprocess
 import sys
 import webbrowser
 import urllib.parse
+import logging
+import platform
+import traceback
 from types import ModuleType
+from datetime import datetime
 from PIL import Image, ImageTk
 import threading
 import urllib.request
@@ -54,9 +58,48 @@ def get_autovid_license() -> ModuleType:
         raise RuntimeError("License module is unavailable")
     return autovid_license
 
+
+def get_app_storage_dir():
+    if getattr(sys, 'frozen', False):
+        root = os.environ.get("APPDATA") or os.environ.get("PROGRAMDATA") or os.path.expanduser("~")
+        path = os.path.join(root, "KnightLogics", "AutoVidCompiler")
+    else:
+        path = os.path.dirname(__file__)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def get_app_logs_dir():
+    path = os.path.join(get_app_storage_dir(), "logs")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def write_bootstrap_log(prefix, message):
+    log_path = os.path.join(get_app_logs_dir(), f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(message)
+        if not message.endswith("\n"):
+            handle.write("\n")
+    return log_path
+
+
+class CompilerGuiLogHandler(logging.Handler):
+    def __init__(self, gui):
+        super().__init__(level=logging.DEBUG)
+        self.gui = gui
+
+    def emit(self, record):
+        try:
+            message = self.format(record) if self.formatter else record.getMessage()
+            tag = "error" if record.levelno >= logging.ERROR else "warning" if record.levelno >= logging.WARNING else "info"
+            self.gui.log_status(f"[COMPILER] {message}", tag=tag)
+        except Exception:
+            pass
+
 class UOVidCompilerGUI:
     # Version info for auto-updates
-    VERSION = "1.3.0"  # Update this when releasing new versions
+    VERSION = "1.3.1"  # Update this when releasing new versions
     GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"  # GitHub repo for auto-updates
     VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v')
     INTRO_EXTENSIONS = VIDEO_EXTENSIONS + ('.gif',)
@@ -85,8 +128,11 @@ class UOVidCompilerGUI:
         # Initialize critical variables first
         self.bundle_dir = self.get_bundle_dir()
         self.storage_dir = self.get_storage_dir()
+        self.gui_logger, self.gui_log_path = self.setup_diagnostics_logging()
         self.config_file = os.path.join(self.storage_dir, "gui_config.json")
+        self.install_exception_logging()
         self.config = self.load_config()
+        self.log_startup_context()
         
         # Initialize logo state variables
         self.has_logo = False
@@ -157,6 +203,7 @@ class UOVidCompilerGUI:
         self.setup_styles()
         self.create_widgets()
         self.load_saved_paths()
+        self.log_status(f"[LOG] GUI diagnostics log: {self.gui_log_path}")
         
         # Start folder monitoring (checks every 5 seconds)
         self.start_folder_monitoring()
@@ -174,13 +221,90 @@ class UOVidCompilerGUI:
 
     def get_storage_dir(self):
         """Return persistent writable app storage."""
-        if getattr(sys, 'frozen', False):
-            root = os.environ.get("APPDATA") or os.environ.get("PROGRAMDATA") or os.path.expanduser("~")
-            path = os.path.join(root, "KnightLogics", "AutoVidCompiler")
-        else:
-            path = os.path.dirname(__file__)
+        return get_app_storage_dir()
+
+    def get_logs_dir(self):
+        path = os.path.join(self.storage_dir, "logs")
         os.makedirs(path, exist_ok=True)
         return path
+
+    def setup_diagnostics_logging(self):
+        log_path = os.path.join(self.get_logs_dir(), f"autovid_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        gui_logger = logging.getLogger("KnightLogics.AutoVidCompiler.GUI")
+        gui_logger.setLevel(logging.DEBUG)
+        gui_logger.propagate = False
+
+        for handler in list(gui_logger.handlers):
+            gui_logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+
+        file_handler = logging.FileHandler(log_path, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        gui_logger.addHandler(file_handler)
+        gui_logger.info("GUI diagnostics logger initialized")
+        return gui_logger, log_path
+
+    def write_diagnostic(self, message, level=logging.INFO, exc_info=None):
+        if not hasattr(self, 'gui_logger') or self.gui_logger is None:
+            return
+        try:
+            self.gui_logger.log(level, str(message), exc_info=exc_info)
+        except Exception:
+            pass
+
+    def log_startup_context(self):
+        self.write_diagnostic(
+            "Startup context: "
+            f"version={self.VERSION} "
+            f"platform={platform.platform()} "
+            f"python={sys.executable} "
+            f"cwd={os.getcwd()} "
+            f"frozen={getattr(sys, 'frozen', False)} "
+            f"bundle_dir={self.bundle_dir} "
+            f"storage_dir={self.storage_dir} "
+            f"config_file={self.config_file}"
+        )
+        self.write_diagnostic(
+            "Feature availability: "
+            f"direct_compilation={DIRECT_COMPILATION} "
+            f"qr_available={QR_AVAILABLE} "
+            f"license_module={autovid_license is not None} "
+            f"ffmpeg={self.get_ffmpeg_path() or 'missing'} "
+            f"ffplay={self.get_ffplay_path() or 'missing'}"
+        )
+
+    def install_exception_logging(self):
+        self.root.report_callback_exception = self.handle_tk_callback_exception
+        sys.excepthook = self.handle_unhandled_exception
+        if hasattr(threading, 'excepthook'):
+            threading.excepthook = self.handle_thread_exception
+
+    def handle_tk_callback_exception(self, exc_type, exc_value, exc_traceback):
+        self.write_diagnostic("Unhandled Tk callback exception", level=logging.ERROR, exc_info=(exc_type, exc_value, exc_traceback))
+        try:
+            self.log_error("Unexpected UI error. Check the logs folder for details.")
+        except Exception:
+            pass
+
+    def handle_unhandled_exception(self, exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            return
+        self.write_diagnostic("Unhandled application exception", level=logging.ERROR, exc_info=(exc_type, exc_value, exc_traceback))
+
+    def handle_thread_exception(self, args):
+        self.write_diagnostic(
+            f"Unhandled thread exception in {getattr(args.thread, 'name', 'unknown-thread')}",
+            level=logging.ERROR,
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+        try:
+            self.root.after(0, lambda: self.log_error("Background thread error. Check the logs folder for details."))
+        except Exception:
+            pass
 
     def get_music_dir(self):
         return os.path.join(self.storage_dir, "Music")
@@ -2674,6 +2798,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             os.environ['CLIP_TIMEFRAME'] = self.clip_timeframe_var.get()
             os.environ['MUSIC_FOLDER'] = self.get_music_dir()
             os.environ['INTRO_FOLDER'] = self.get_intro_dir()
+            os.environ['AUTOVID_LOG_DIR'] = self.get_logs_dir()
+            os.environ['AUTOVID_LOG_LEVEL'] = 'DEBUG'
             
             # Log the settings being used
             self.log_status(f"[CONFIG] Trim seconds: {self.trim_seconds_var.get()}")
@@ -2687,6 +2813,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             if DIRECT_COMPILATION and hasattr(UOVidCompiler, 'main'):
                 # Run compilation directly with live output capture
                 self.log_status("[OK] Running compilation directly in same process...")
+                compiler_gui_handler = None
+                compiler_logger = None
                 
                 # CRITICAL: Update the CONFIG dictionary directly since module is already imported
                 if hasattr(UOVidCompiler, 'CONFIG'):
@@ -2707,6 +2835,20 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                     UOVidCompiler.CONFIG['progress_callback'] = self.set_progress
                     UOVidCompiler.CONFIG['cancel_callback'] = lambda: self.stop_requested
                     self.log_status("[OK] CONFIG dictionary updated with GUI selections")
+
+                if hasattr(UOVidCompiler, 'configure_logging'):
+                    UOVidCompiler.configure_logging(log_dir=self.get_logs_dir(), log_level='DEBUG')
+
+                compiler_logger = getattr(UOVidCompiler, 'logger', None)
+                if isinstance(compiler_logger, logging.Logger):
+                    compiler_gui_handler = CompilerGuiLogHandler(self)
+                    compiler_gui_handler.setFormatter(logging.Formatter('%(levelname)s %(message)s'))
+                    compiler_logger.addHandler(compiler_gui_handler)
+
+                if hasattr(UOVidCompiler, 'get_log_file_path'):
+                    compiler_log_path = UOVidCompiler.get_log_file_path()
+                    if compiler_log_path:
+                        self.log_status(f"[LOG] Compiler diagnostics log: {compiler_log_path}")
                 
                 # Create a custom stdout that writes to GUI in real-time
                 class GUIOutputStream:
@@ -2733,10 +2875,6 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 sys.stderr = gui_output
                 
                 try:
-                    # Disable logging to prevent the 'NoneType' write errors
-                    import logging
-                    logging.disable(logging.CRITICAL)
-                    
                     # Run the main compilation function directly
                     UOVidCompiler.main()
                     success = True
@@ -2745,13 +2883,13 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 except Exception as e:
                     success = False
                     self.log_status(f"[ERROR] Compilation error: {str(e)}")
+                    self.write_diagnostic("Direct compilation exception", level=logging.ERROR, exc_info=True)
                 finally:
-                    # Re-enable logging
-                    logging.disable(logging.NOTSET)
-                    
                     # Restore original stdout/stderr
                     sys.stdout = original_stdout
                     sys.stderr = original_stderr
+                    if isinstance(compiler_logger, logging.Logger) and compiler_gui_handler is not None:
+                        compiler_logger.removeHandler(compiler_gui_handler)
                             
             else:
                 # Fallback to subprocess if direct import failed
@@ -2761,7 +2899,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         except Exception as e:
             success = False
             self.log_status(f"[ERROR] Thread error: {str(e)}")
-            print(f"DEBUG: Thread exception: {e}")
+            self.write_diagnostic("Compilation thread exception", level=logging.ERROR, exc_info=True)
         
         # Handle completion on main thread
         self.root.after(0, lambda: self._handle_compilation_completion(success))
@@ -2807,6 +2945,10 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             env['CLIP_TIMEFRAME'] = self.clip_timeframe_var.get()
             env['MUSIC_FOLDER'] = self.get_music_dir()
             env['INTRO_FOLDER'] = self.get_intro_dir()
+            env['AUTOVID_LOG_DIR'] = self.get_logs_dir()
+            env['AUTOVID_LOG_LEVEL'] = 'DEBUG'
+
+            self.log_status(f"[LOG] Subprocess diagnostics directory: {env['AUTOVID_LOG_DIR']}")
             
             process = subprocess.Popen(
                 [sys.executable, "-u", script_path],
@@ -2832,6 +2974,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             
         except Exception as e:
             self.log_status(f"[ERROR] Subprocess error: {str(e)}")
+            self.write_diagnostic("Subprocess compilation exception", level=logging.ERROR, exc_info=True)
             return False
         
         finally:
@@ -2888,7 +3031,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
     
     def view_logs(self):
         """View application logs"""
-        logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+        logs_dir = self.get_logs_dir()
         if os.path.exists(logs_dir):
             try:
                 os.startfile(logs_dir)
@@ -3071,8 +3214,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
     
     def _log_status_main_thread(self, message, tag="info"):
         """Internal method to log status - must be called from main thread"""
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        message = str(message)
         
         # Remove problematic Unicode characters for standalone EXE compatibility
         safe_message = message
@@ -3080,6 +3223,13 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             # Running from executable - replace any remaining Unicode characters with ASCII
             # Use only ASCII in the replacement process
             safe_message = safe_message.encode('ascii', errors='replace').decode('ascii')
+
+        level_map = {
+            "error": logging.ERROR,
+            "warning": logging.WARNING,
+            "success": logging.INFO,
+        }
+        self.write_diagnostic(safe_message, level=level_map.get(tag, logging.INFO))
         
         log_message = f"[{timestamp}] {safe_message}\n"
 
@@ -3090,7 +3240,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         try:
             # Ensure widget is normal state and insert text
             self.status_text.config(state='normal')
-            self.status_text.insert('end', log_message)
+            self.status_text.insert('end', log_message, tag)
             self.status_text.see('end')
             
             # Force immediate updates
@@ -3103,7 +3253,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 self.status_text.delete('1.0', f"{len(lines)-1000}.0")
                 
         except Exception as e:
-            print(f"ERROR in log_status: {e}")
+            self.write_diagnostic(f"ERROR in log_status: {e}", level=logging.ERROR, exc_info=True)
     
     def log_success(self, message):
         """Log a success message in green"""
@@ -3121,10 +3271,12 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         """Load saved configuration"""
         try:
             if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    return json.load(f)
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                self.write_diagnostic(f"Loaded config from {self.config_file}")
+                return config
         except Exception as e:
-            print(f"Error loading config: {e}")
+            self.write_diagnostic(f"Error loading config: {e}", level=logging.ERROR, exc_info=True)
         
         return {
             "input_path": os.path.expanduser("~/Videos/Captures"), 
@@ -3145,10 +3297,11 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 # Resolution auto-detected - no GUI config needed
             }
             
-            with open(self.config_file, 'w') as f:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2)
+            self.write_diagnostic(f"Saved config to {self.config_file}")
         except Exception as e:
-            print(f"Error saving config: {e}")
+            self.write_diagnostic(f"Error saving config: {e}", level=logging.ERROR, exc_info=True)
     
     def load_saved_paths(self):
         """Load previously saved configuration"""
@@ -3738,9 +3891,9 @@ def main():
         app = UOVidCompilerGUI()
         app.run()
     except Exception as e:
-        import traceback
         error_msg = f"Error starting UO Video Compiler GUI:\n{traceback.format_exc()}"
-        print(error_msg)
+        log_path = write_bootstrap_log("autovid_gui_startup_failure", error_msg)
+        print(f"{error_msg}\nLogged to: {log_path}")
         
         # Try to show error in messagebox if possible
         try:
@@ -3748,7 +3901,7 @@ def main():
             from tkinter import messagebox
             root = tk.Tk()
             root.withdraw()
-            messagebox.showerror("Application Error", error_msg)
+            messagebox.showerror("Application Error", f"{error_msg}\n\nLogged to: {log_path}")
         except:
             pass
 
