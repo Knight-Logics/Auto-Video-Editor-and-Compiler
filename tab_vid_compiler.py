@@ -221,7 +221,7 @@ class VidCompilerTab:
         intro_frame = ttk.Frame(options_container, style='Custom.TFrame')
         intro_frame.grid(row=0, column=2, sticky='ew', padx=(10, 0))
 
-        ttk.Label(intro_frame, text="Intro:", style='Info.TLabel').pack(anchor='w')
+        ttk.Label(intro_frame, text="Intro Video:", style='Info.TLabel').pack(anchor='w')
         intro_options = self.get_available_intros()
         if not self.intro_selection_var.get() and intro_options:
             self.intro_selection_var.set(intro_options[0])
@@ -357,32 +357,20 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             return ['None', '[RANDOM] Random']
     
     def get_available_intros(self):
-        """Get list of available intro video files"""
-        try:
-            intro_dir = os.path.join(os.path.dirname(__file__), "Intros")
-            if not os.path.exists(intro_dir):
-                return ['None', 'StockDefault']
-            
-            intro_files = ['None']
-            stock_default_found = False
-            
+        """None, Stock, or Random — stock intro file only."""
+        intro_dir = os.path.join(os.path.dirname(__file__), "Intros")
+        stock_found = False
+        if os.path.isdir(intro_dir):
             for file in os.listdir(intro_dir):
-                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-                    filename = os.path.splitext(file)[0]
-                    if filename == 'StockDefault':
-                        stock_default_found = True
-                    else:
-                        intro_files.append(filename)
-            
-            result = []
-            if stock_default_found:
-                result.append('StockDefault')
-            result.append('[RANDOM] Random')
-            result.extend(sorted(intro_files))
-            
-            return result if result else ['StockDefault']
-        except Exception:
-            return ['StockDefault']
+                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v', '.gif')):
+                    if os.path.splitext(file)[0] == 'StockDefault':
+                        stock_found = True
+                        break
+        options = ['None']
+        if stock_found:
+            options.append('Stock')
+        options.append('[RANDOM] Random')
+        return options
     
     def update_paths_display(self):
         """Update the current paths display"""

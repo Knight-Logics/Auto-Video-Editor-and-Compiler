@@ -5,7 +5,7 @@ A portable video compilation script for Ultima Online gameplay videos.
 Compiles the last 5 seconds of videos with music and intro support.
 
 [MUSIC] MUSIC INCLUDED: 10 royalty-free background tracks ready to use!
-[VIDEO] INTROS INCLUDED: 3 professional intro videos for your compilations!
+[VIDEO] STOCK INTRO: One bundled stock intro video (None / Stock / Random in the GUI).
 [TOOLS] FFMPEG INCLUDED: No need to download or install FFmpeg separately!
 
 Setup Instructions:
@@ -965,21 +965,25 @@ def generate_unique_filename(base_name="BMagic_Compilation", extension=".mp4"):
     name_without_ext = os.path.splitext(base_name)[0]
     return f"{name_without_ext}_{timestamp}{extension}"
 
-def select_random_intro():
-    """Select a random intro video"""
-    if not CONFIG["use_intro"] or not os.path.exists(CONFIG["intro_folder"]):
+STOCK_INTRO_BASENAME = "StockDefault"
+
+
+def resolve_stock_intro_path():
+    """Only the bundled stock intro is supported."""
+    if not os.path.exists(CONFIG["intro_folder"]):
         return None
-    
-    intro_files = []
     for ext in CONFIG["intro_extensions"]:
-        pattern = os.path.join(CONFIG["intro_folder"], f"*{ext}")
-        import glob
-        intro_files.extend(glob.glob(pattern))
-    
-    if not intro_files:
+        intro_file = os.path.join(CONFIG["intro_folder"], f"{STOCK_INTRO_BASENAME}{ext}")
+        if os.path.exists(intro_file):
+            return intro_file
+    return None
+
+
+def select_random_intro():
+    """Random intro uses the stock intro file only."""
+    if not CONFIG["use_intro"]:
         return None
-    
-    return random.choice(intro_files)
+    return resolve_stock_intro_path()
 
 def validate_and_convert_audio(file_path, temp_dir):
     """
@@ -1402,50 +1406,25 @@ def select_random_music():
 
 
 def select_intro_video():
-    """Select intro video - either user selection from GUI or random"""
-    
-    # Return None if user selected "None" (disable intro)
-    if CONFIG["intro_selection"] == "None":
+    """Select intro video: None, stock file only, or random (stock file only)."""
+    selection = CONFIG.get("intro_selection", "")
+
+    if selection == "None":
         logger.info("Intro disabled (None selected)")
         return None
-    
-    if not os.path.exists(CONFIG["intro_folder"]):
+
+    stock_path = resolve_stock_intro_path()
+    if not stock_path:
+        logger.warning("Stock intro file not found in intro folder")
         return None
-    
-    # Check if user selected specific intro from GUI
-    print(f"DEBUG: CONFIG['intro_selection'] = '{CONFIG['intro_selection']}'")
-    print(f"DEBUG: Checking if not empty and not Random...")
-    
-    if CONFIG["intro_selection"] and CONFIG["intro_selection"] != "[RANDOM] Random":
-        # Look for the selected intro file (without extension in the name)
-        intro_name = CONFIG["intro_selection"]
-        print(f"DEBUG: Searching for intro: '{intro_name}'")
-        print(f"DEBUG: Looking in folder: {CONFIG['intro_folder']}")
-        
-        for ext in CONFIG["intro_extensions"]:
-            intro_file = os.path.join(CONFIG["intro_folder"], f"{intro_name}{ext}")
-            print(f"DEBUG: Checking: {intro_file}")
-            if os.path.exists(intro_file):
-                logger.info(f"Using selected intro: {intro_name}")
-                print(f"DEBUG: FOUND! Using {intro_file}")
-                return intro_file
-        
-        print(f"DEBUG: Intro '{intro_name}' not found, falling back to random")
-    else:
-        print(f"DEBUG: No specific intro selected or Random selected, using random selection")
-    
-    # Fall back to random selection if no specific choice or file not found
-    intro_files = []
-    for ext in CONFIG["intro_extensions"]:
-        pattern = os.path.join(CONFIG["intro_folder"], f"*{ext}")
-        intro_files.extend(glob.glob(pattern))
-    
-    if intro_files:
-        selected = random.choice(intro_files)
-        logger.info(f"Using random intro: {os.path.basename(selected)}")
-        return selected
-    
-    return None
+
+    if selection in (STOCK_INTRO_BASENAME, "[RANDOM] Random"):
+        label = "stock" if selection == STOCK_INTRO_BASENAME else "random (stock)"
+        logger.info(f"Using {label} intro: {os.path.basename(stock_path)}")
+        return stock_path
+
+    logger.warning(f"Unknown intro selection '{selection}', using stock intro")
+    return stock_path
 
 
 def cleanup_temp_files(temp_files):

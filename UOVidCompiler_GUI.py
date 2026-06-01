@@ -99,11 +99,13 @@ class CompilerGuiLogHandler(logging.Handler):
 
 class UOVidCompilerGUI:
     # Version info for auto-updates
-    VERSION = "1.3.2"  # Update this when releasing new versions
+    VERSION = "1.3.3"  # Update this when releasing new versions
     RELEASE_EXE_NAME = "Auto_Video_Compiler.exe"
     GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"  # GitHub repo for auto-updates
     VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v')
     INTRO_EXTENSIONS = VIDEO_EXTENSIONS + ('.gif',)
+    STOCK_INTRO_BASENAME = 'StockDefault'
+    INTRO_OPTION_STOCK = 'Stock'
     MUSIC_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac')
     CLIP_ORDER_OPTIONS = ('newest_first', 'oldest_first', 'filename_az', 'filename_za', 'custom')
     CLIP_TIMEFRAME_OPTIONS = (
@@ -158,7 +160,6 @@ class UOVidCompilerGUI:
         self.custom_order_file = os.path.join(self.storage_dir, "custom_clip_order.json")
         self.preview_process = None
         self.stop_requested = False
-        self.license_use_consumed_for_run = False
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_text_var = tk.StringVar(value="Idle")
         self.status_text = None
@@ -346,6 +347,10 @@ class UOVidCompilerGUI:
             for name in os.listdir(source_dir):
                 if not name.lower().endswith(extensions):
                     continue
+                if folder_name == "Intros":
+                    stem = os.path.splitext(name)[0]
+                    if stem != self.STOCK_INTRO_BASENAME:
+                        continue
                 src = os.path.join(source_dir, name)
                 dst = os.path.join(target_dir, name)
                 if os.path.isfile(src) and not os.path.exists(dst):
@@ -643,33 +648,29 @@ class UOVidCompilerGUI:
             font=('Segoe UI', 9)
         ).pack(anchor='center', pady=(2, 0))
 
-        # Center: Demo placeholder section
+        # Center: quick tips (no demo video until one is published)
         title_frame = ttk.Frame(header_frame, style='Header.TFrame')
         title_frame.pack(side='left', fill='both', expand=True, padx=(0, 12))
-        
-        # Create inner frame for vertical centering
+
         title_inner = ttk.Frame(title_frame, style='Header.TFrame')
         title_inner.pack(anchor='center', expand=True)
-        
+
+        quick_tips = (
+            "Quick tips\n"
+            "• Double-click a clip thumbnail to preview\n"
+            "• Bottom-right on each card: seconds from the end of that clip\n"
+            "• Drag thumbnails to reorder; use timeframe bubbles to filter\n"
+            "• Browse for input/output folders; Add Music… or Open folder for tracks\n"
+            "• Intro Video: None, Stock, or Random (bundled stock intro)\n"
+            "• RUN VIDEO COMPILER builds your video; STOP cancels (no credit used)"
+        )
         ttk.Label(
             title_inner,
-            text="Demo video placeholder",
+            text=quick_tips,
             style='Heading.TLabel',
-            font=('Segoe UI', 10, 'bold')
+            font=('Segoe UI', 8),
+            justify='left',
         ).pack(anchor='w')
-
-        tk.Button(
-            title_inner,
-            text="Watch Demo",
-            command=self.open_demo_video,
-            font=('Segoe UI', 8, 'bold'),
-            bg=self.colors['button'],
-            fg='white',
-            relief='raised',
-            padx=10,
-            pady=4,
-            cursor='hand2',
-        ).pack(anchor='w', pady=(4, 0))
 
         # Right side: licensing and attribution
         license_frame = ttk.Frame(header_frame, style='Header.TFrame')
@@ -925,34 +926,48 @@ class UOVidCompilerGUI:
         except Exception:
             return ['None', '[RANDOM] Random']
     
+    def get_stock_intro_path(self):
+        """Return the bundled stock intro media file, if present."""
+        intro_dir = self.get_intro_dir()
+        if not os.path.isdir(intro_dir):
+            return ""
+        for file in os.listdir(intro_dir):
+            if not file.lower().endswith(self.INTRO_EXTENSIONS):
+                continue
+            if os.path.splitext(file)[0] == self.STOCK_INTRO_BASENAME:
+                return os.path.join(intro_dir, file)
+        return ""
+
+    def stock_intro_available(self):
+        return bool(self.get_stock_intro_path())
+
+    def normalize_intro_selection(self, selection):
+        """Map saved values to the fixed intro dropdown options."""
+        selection = str(selection or "").strip()
+        legacy_stock = {self.STOCK_INTRO_BASENAME, self.INTRO_OPTION_STOCK}
+        options = self.get_available_intros()
+        if selection in options:
+            return selection
+        if selection in legacy_stock and self.INTRO_OPTION_STOCK in options:
+            return self.INTRO_OPTION_STOCK
+        if selection == "[RANDOM] Random" and "[RANDOM] Random" in options:
+            return "[RANDOM] Random"
+        return options[0] if options else "None"
+
+    def intro_selection_for_compiler(self):
+        """Value passed to UOVidCompiler (stock file basename is StockDefault)."""
+        selection = self.intro_selection_var.get()
+        if selection == self.INTRO_OPTION_STOCK:
+            return self.STOCK_INTRO_BASENAME
+        return selection
+
     def get_available_intros(self):
-        """Get list of available intro video files"""
-        try:
-            intro_dir = self.get_intro_dir()
-            if not os.path.exists(intro_dir):
-                return ['StockDefault']
-            
-            intro_files = []
-            stock_default_found = False
-            
-            for file in os.listdir(intro_dir):
-                if file.lower().endswith(self.INTRO_EXTENSIONS):
-                    filename = os.path.splitext(file)[0]  # Remove extension for display
-                    if filename == 'StockDefault':
-                        stock_default_found = True
-                    else:
-                        intro_files.append(filename)
-            
-            # Put None first, then StockDefault if it exists, then Random, then alphabetically sorted others
-            result = ['None']
-            if stock_default_found:
-                result.append('StockDefault')
-            result.append('[RANDOM] Random')
-            result.extend(sorted(intro_files))
-            
-            return result if result else ['None', '[RANDOM] Random']
-        except Exception:
-            return ['None', '[RANDOM] Random']
+        """Intro choices: None (default), Stock, or Random — stock file only."""
+        options = ["None"]
+        if self.stock_intro_available():
+            options.append(self.INTRO_OPTION_STOCK)
+        options.append("[RANDOM] Random")
+        return options
     
     def create_action_section(self, parent):
         """Create action buttons section with video configuration options"""
@@ -976,7 +991,7 @@ class UOVidCompilerGUI:
 
         ttk.Label(options_container, text="Seconds Trimmed from End:", style='Info.TLabel').grid(row=0, column=0, sticky='w', padx=5)
         ttk.Label(options_container, text="Background Music:", style='Info.TLabel').grid(row=0, column=1, sticky='w', padx=5)
-        ttk.Label(options_container, text="Intro:", style='Info.TLabel').grid(row=0, column=2, sticky='w', padx=5)
+        ttk.Label(options_container, text="Intro Video:", style='Info.TLabel').grid(row=0, column=2, sticky='w', padx=5)
 
         trim_options = ['None', '5', '10', '15', '20', '25', '30']
         self.trim_seconds_var.set('15')  # Default to 15 seconds like S+ working version
@@ -1024,42 +1039,15 @@ class UOVidCompilerGUI:
         music_link.bind('<Button-1>', lambda _event: self.open_music_folder())
 
         intro_options = self.get_available_intros()
-        # Set default to None if empty
-        if not self.intro_selection_var.get() and intro_options:
-            self.intro_selection_var.set(intro_options[0])  # 'None'
+        self.intro_selection_var.set(self.normalize_intro_selection(self.intro_selection_var.get() or "None"))
         self.intro_combo = ttk.Combobox(options_container, textvariable=self.intro_selection_var,
                                  values=intro_options, state='readonly')
         self.intro_combo.grid(row=1, column=2, sticky='ew', padx=5, pady=(2, 0))
-        # Ensure current selection is visible
         if self.intro_selection_var.get() in intro_options:
             self.intro_combo.current(intro_options.index(self.intro_selection_var.get()))
         else:
             self.intro_combo.current(0)
         self.intro_combo.bind('<<ComboboxSelected>>', lambda _event: self.save_config())
-        intro_tools = ttk.Frame(options_container, style='Custom.TFrame')
-        intro_tools.grid(row=2, column=2, sticky='w', padx=5, pady=(3, 0))
-        tk.Button(
-            intro_tools,
-            text="Add Intro/GIF...",
-            command=self.add_intro_files,
-            font=('Segoe UI', 8),
-            bg=self.colors['button'],
-            fg='white',
-            relief='raised',
-            cursor='hand2',
-            padx=6,
-            pady=2,
-        ).pack(side='left')
-        intro_link = tk.Label(
-            intro_tools,
-            text="Open folder",
-            bg=self.colors['frame_bg'],
-            fg=self.colors['accent'],
-            cursor='hand2',
-            font=('Segoe UI', 8, 'underline'),
-        )
-        intro_link.pack(side='left', padx=(8, 0))
-        intro_link.bind('<Button-1>', lambda _event: self.open_intro_folder())
 
         self.create_clip_selection_panel(action_frame)
 
@@ -1199,31 +1187,18 @@ class UOVidCompilerGUI:
             justify='left',
         ).pack(side='left', anchor='w')
 
-        tk.Button(
-            toolbar,
-            text="Restore Filtered List",
-            command=lambda: self.refresh_clip_selection_panel(preserve_saved=False),
-            font=('Segoe UI', 8),
-            bg=self.colors['button'],
-            fg='white',
-            relief='raised',
+        self.clip_show_all_link = tk.Label(
+            summary_row,
+            text="Show all in timeframe",
+            bg=self.colors['frame_bg'],
+            fg=self.colors['accent'],
+            font=('Segoe UI', 8, 'underline'),
             cursor='hand2',
-            padx=8,
-            pady=3,
-        ).pack(side='right')
-
-        tk.Button(
-            toolbar,
-            text="Save Selection",
-            command=lambda: self.persist_clip_selection_snapshot(log_message=True),
-            font=('Segoe UI', 8),
-            bg=self.colors['accent'],
-            fg='white',
-            relief='raised',
-            cursor='hand2',
-            padx=8,
-            pady=3,
-        ).pack(side='right', padx=(0, 8))
+        )
+        self.clip_show_all_link.bind(
+            '<Button-1>',
+            lambda _event: self.refresh_clip_selection_panel(preserve_saved=False),
+        )
 
         body = tk.Frame(panel, bg=self.colors['frame_bg'])
         body.pack(fill='both', expand=True)
@@ -1303,9 +1278,10 @@ Automatically combines multiple short clips into one polished video with intro a
    * Music loops/extends to match total video length
    * Mixed at lower volume so original audio stays clear
 
-[INTRO] INTRO SELECTION: Optional intro video to start compilation
-   * Intro formats: MP4, AVI, MOV, MKV, WEBM, M4V, GIF
-   * Adds professional touch to your final video
+[INTRO] INTRO VIDEO: Optional stock intro at the start of the compilation
+   * None = no intro (default)
+   * Stock = bundled stock intro video
+   * Random = stock intro (same file; kept for a simple random option)
    * Intro duration matches your trim seconds setting
 
 [ORDER] CLIP ORDER: Choose newest-first, oldest-first, filename order, or save a custom order
@@ -1314,6 +1290,8 @@ Automatically combines multiple short clips into one polished video with intro a
    * Creates: Intro + All Clips + Background Music = Final Video
    * Progress shown in this status area
    * Output saved to your Videos folder
+   * A compile credit is recorded only after a successful run
+   * STOP cancels the current step; no credit is used when you stop
 
 [TIP] WORKFLOW TIP: 
    1. Clean out old/unwanted clips before running (to avoid too many clips)
@@ -1361,11 +1339,9 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         return []
         
     def get_intro_files(self):
-        """Get list of available intro files"""
-        intro_dir = self.get_intro_dir()
-        if os.path.exists(intro_dir):
-            return [f for f in os.listdir(intro_dir) if f.lower().endswith(self.INTRO_EXTENSIONS)]
-        return []
+        """Stock intro file only (used for path summary)."""
+        stock_path = self.get_stock_intro_path()
+        return [os.path.basename(stock_path)] if stock_path else []
 
     def refresh_license_status(self):
         """Refresh license/trial status from the server, falling back to signed local state."""
@@ -1396,7 +1372,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             self.license_status_var.set("License status unavailable")
 
     def ensure_compile_entitlement(self):
-        """Consume one compile entitlement before FFmpeg work starts."""
+        """Verify a compile may start; credits are consumed only after success."""
         if autovid_license is None:
             messagebox.showerror(
                 "License Error",
@@ -1405,15 +1381,13 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             return False
 
         license_api = get_autovid_license()
-        ok, status, warning = license_api.consume_use()
+        ok, status, warning = license_api.can_compile_use()
         self.apply_license_status(status)
         if warning:
             self.log_warning(warning)
 
         if ok:
-            self.license_use_consumed_for_run = True
-            entitlement = status.get("entitlement", "use")
-            self.log_status(f"[LICENSE] Recorded one {entitlement} compilation use.")
+            self.log_status("[LICENSE] Compile allowed — one credit is used only after a successful run.")
             return True
 
         self.show_checkout_window()
@@ -1423,13 +1397,9 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         )
         return False
 
-    def record_successful_compile_use(self):
-        """Count one completed compilation after a successful output."""
+    def consume_compile_entitlement_on_success(self):
+        """Record one compilation use after the output is created successfully."""
         if autovid_license is None:
-            return
-        if self.license_use_consumed_for_run:
-            threading.Thread(target=self.refresh_license_status, daemon=True).start()
-            self.log_status("[LICENSE] Compile entitlement was already recorded before processing.")
             return
         license_api = get_autovid_license()
         ok, status, warning = license_api.consume_use()
@@ -2109,6 +2079,12 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         summary += f" | {self.clip_order_var.get()}"
         self.clip_selection_summary_var.set(summary)
 
+        if hasattr(self, 'clip_show_all_link'):
+            if filtered_count > 0 and selection_count < filtered_count:
+                self.clip_show_all_link.pack(side='right', padx=(8, 0))
+            else:
+                self.clip_show_all_link.pack_forget()
+
         self.draw_clip_selection_rows()
         if save_snapshot:
             self.persist_clip_selection_snapshot(log_message=False)
@@ -2704,12 +2680,11 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             messagebox.showerror(
                 "No Selected Videos",
                 "The current clip selection is empty.\n\n"
-                "Widen the timeframe bubble or click Restore Filtered List before running the compiler."
+                "Widen the timeframe bubble or use Show all in timeframe before running the compiler."
             )
             return
         self.persist_clip_selection_snapshot(log_message=False)
 
-        self.license_use_consumed_for_run = False
         if not self.ensure_compile_entitlement():
             return
         
@@ -2793,7 +2768,9 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         
         # Test log_status from background thread
         self.log_status("[START] Background compilation thread started")
-        
+        success = False
+        cancelled = False
+
         try:
             # Set up environment variables for the compilation
             os.environ['GUI_MODE'] = '1'  # Prevent waiting for input
@@ -2801,7 +2778,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             os.environ['VIDEO_OUTPUT_PATH'] = self.output_path_var.get()
             os.environ['TRIM_SECONDS'] = self.trim_seconds_var.get()
             os.environ['MUSIC_SELECTION'] = self.music_selection_var.get()
-            os.environ['INTRO_SELECTION'] = self.intro_selection_var.get()
+            os.environ['INTRO_SELECTION'] = self.intro_selection_for_compiler()
             os.environ['CLIP_ORDER'] = self.clip_order_var.get()
             os.environ['CUSTOM_ORDER_FILE'] = self.custom_order_file
             os.environ['CLIP_TIMEFRAME'] = self.clip_timeframe_var.get()
@@ -2813,7 +2790,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             # Log the settings being used
             self.log_status(f"[CONFIG] Trim seconds: {self.trim_seconds_var.get()}")
             self.log_status(f"[CONFIG] Music selection: {self.music_selection_var.get()}")
-            self.log_status(f"[CONFIG] Intro selection: {self.intro_selection_var.get()}")
+            self.log_status(f"[CONFIG] Intro selection: {self.intro_selection_for_compiler()}")
             self.log_status(f"[CONFIG] Clip order: {self.clip_order_var.get()}")
             self.log_status(f"[CONFIG] Clip timeframe: {self.get_clip_timeframe_label()}")
             
@@ -2829,7 +2806,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 if hasattr(UOVidCompiler, 'CONFIG'):
                     trim_selection = self.trim_seconds_var.get()
                     trim_value = None if trim_selection == 'None' else int(trim_selection)
-                    UOVidCompiler.CONFIG['intro_selection'] = self.intro_selection_var.get()
+                    UOVidCompiler.CONFIG['intro_selection'] = self.intro_selection_for_compiler()
                     UOVidCompiler.CONFIG['music_selection'] = self.music_selection_var.get()
                     UOVidCompiler.CONFIG['trim_seconds'] = trim_value
                     UOVidCompiler.CONFIG['clip_duration'] = float(trim_value) if trim_value is not None else 999999.0
@@ -2840,7 +2817,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                     UOVidCompiler.CONFIG['clip_timeframe'] = self.clip_timeframe_var.get()
                     UOVidCompiler.CONFIG['music_folder'] = self.get_music_dir()
                     UOVidCompiler.CONFIG['intro_folder'] = self.get_intro_dir()
-                    UOVidCompiler.CONFIG['use_intro'] = self.intro_selection_var.get() != 'None'
+                    UOVidCompiler.CONFIG['use_intro'] = self.intro_selection_for_compiler() != 'None'
                     UOVidCompiler.CONFIG['progress_callback'] = self.set_progress
                     UOVidCompiler.CONFIG['cancel_callback'] = lambda: self.stop_requested
                     self.log_status("[OK] CONFIG dictionary updated with GUI selections")
@@ -2884,13 +2861,18 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 sys.stderr = gui_output
                 
                 try:
-                    # Run the main compilation function directly
-                    UOVidCompiler.main()
-                    success = True
-                    self.log_status("[SUCCESS] Direct compilation completed successfully!")
-                    
+                    compile_result = UOVidCompiler.main()
+                    cancelled = bool(self.stop_requested and not compile_result)
+                    success = bool(compile_result) and not cancelled
+                    if success:
+                        self.log_status("[SUCCESS] Direct compilation completed successfully!")
+                    elif cancelled:
+                        self.log_status("[STOP] Compilation cancelled.")
+                    else:
+                        self.log_status("[ERROR] Compilation did not complete.")
                 except Exception as e:
                     success = False
+                    cancelled = bool(self.stop_requested)
                     self.log_status(f"[ERROR] Compilation error: {str(e)}")
                     self.write_diagnostic("Direct compilation exception", level=logging.ERROR, exc_info=True)
                 finally:
@@ -2904,19 +2886,21 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 # Fallback to subprocess if direct import failed
                 self.log_status("[WARNING] Falling back to subprocess method...")
                 success = self._run_subprocess_compilation()
-                
+                cancelled = bool(self.stop_requested and not success)
+
         except Exception as e:
             success = False
+            cancelled = bool(self.stop_requested)
             self.log_status(f"[ERROR] Thread error: {str(e)}")
             self.write_diagnostic("Compilation thread exception", level=logging.ERROR, exc_info=True)
         
         # Handle completion on main thread
-        self.root.after(0, lambda: self._handle_compilation_completion(success))
+        self.root.after(0, lambda: self._handle_compilation_completion(success, cancelled))
                 
-    def _handle_compilation_completion(self, success):
+    def _handle_compilation_completion(self, success, cancelled=False):
         """Handle completion of compilation process"""
         if success:
-            self.record_successful_compile_use()
+            self.consume_compile_entitlement_on_success()
             self.set_progress(100, "Compilation complete")
             self.log_status("[SUCCESS] Video compilation completed successfully!")
             messagebox.showinfo("Success!", 
@@ -2925,11 +2909,22 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 state='normal', 
                 text="[OK] Compilation Complete! Click to Compile Again",
                 bg=self.colors['success'])
+        elif cancelled:
+            self.set_progress(0, "Cancelled")
+            self.log_status("[STOP] Compilation cancelled — no credit was used.")
+            messagebox.showinfo(
+                "Stopped",
+                "Compilation was stopped.\n\nNo compile credit was used."
+            )
+            self.run_btn.configure(
+                state='normal',
+                text="RUN VIDEO COMPILER",
+                bg=self.colors['button'])
         else:
-            self.set_progress(0, "Stopped or failed")
-            self.log_status("[ERROR] Compilation failed")
+            self.set_progress(0, "Failed")
+            self.log_status("[ERROR] Compilation failed — no credit was used.")
             messagebox.showerror("Compilation Failed", 
-                "Compilation failed\n\nCheck the status log for details.")
+                "Compilation failed.\n\nNo compile credit was used. Check the status log for details.")
             self.run_btn.configure(
                 state='normal', 
                 text="[ERROR] Compilation Failed - Click to Try Again",
@@ -2948,7 +2943,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             env['VIDEO_OUTPUT_PATH'] = self.output_path_var.get()
             env['TRIM_SECONDS'] = self.trim_seconds_var.get()
             env['MUSIC_SELECTION'] = self.music_selection_var.get()
-            env['INTRO_SELECTION'] = self.intro_selection_var.get()
+            env['INTRO_SELECTION'] = self.intro_selection_for_compiler()
             env['CLIP_ORDER'] = self.clip_order_var.get()
             env['CUSTOM_ORDER_FILE'] = self.custom_order_file
             env['CLIP_TIMEFRAME'] = self.clip_timeframe_var.get()
@@ -3123,11 +3118,10 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             if hasattr(self, 'intro_combo'):
                 self.intro_combo['values'] = intro_options
                 
-                # Restore selection if still valid, otherwise default to StockDefault
                 if current_selection in intro_options:
                     self.intro_selection_var.set(current_selection)
                 else:
-                    self.intro_selection_var.set(intro_options[0] if intro_options else 'StockDefault')
+                    self.intro_selection_var.set(self.normalize_intro_selection(current_selection))
                 
                 self.log_status(f"[OK] Intro list refreshed - {len(intro_options)} intro media files available")
         except Exception as e:
@@ -3323,7 +3317,9 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         if hasattr(self, 'music_selection_var'):
             self.music_selection_var.set(self.config.get("music_selection") or "None")
         if hasattr(self, 'intro_selection_var'):
-            self.intro_selection_var.set(self.config.get("intro_selection") or "None")
+            self.intro_selection_var.set(
+                self.normalize_intro_selection(self.config.get("intro_selection") or "None")
+            )
         if hasattr(self, 'clip_order_var'):
             self.clip_order_var.set(self.config.get("clip_order", "newest_first"))
         if hasattr(self, 'clip_timeframe_var'):

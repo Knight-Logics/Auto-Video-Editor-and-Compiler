@@ -205,6 +205,53 @@ def get_status(prefer_remote=True):
     return state
 
 
+def _has_compile_entitlement(state):
+    """True when the account may start a compile (does not consume a use)."""
+    now = int(time.time())
+    if bool(state.get("unlimited_active", False)):
+        period_end = int(state.get("subscription_current_period_end", 0) or 0)
+        if period_end <= 0 or period_end > now:
+            return True
+    if int(state.get("credits", 0) or 0) > 0:
+        return True
+    free_used = int(state.get("free_used", 0) or 0)
+    free_limit = int(state.get("free_limit", FREE_TRIAL_USES) or FREE_TRIAL_USES)
+    return free_used < free_limit
+
+
+def can_compile_use():
+    """Check entitlement without consuming. Credits are charged only after success."""
+    remote = _request("status")
+    if remote.get("ok"):
+        state = _merge_remote_status(remote)
+        state["source"] = "server"
+        if _has_compile_entitlement(state):
+            return True, state, ""
+        return False, state, "No free uses or paid credits are available."
+
+    state = _load_state()
+    now = int(time.time())
+    if not state.get("last_remote_sync"):
+        state["source"] = "local"
+        return False, state, "License server is required before the first compile use can be granted."
+
+    if not _has_compile_entitlement(state):
+        state["source"] = "local"
+        return False, state, "No free uses or paid credits are available."
+
+    unlimited_active = bool(state.get("unlimited_active", False))
+    last_sync = int(state.get("last_remote_sync", 0) or 0)
+    period_end = int(state.get("subscription_current_period_end", 0) or 0)
+    subscription_not_expired = period_end <= 0 or period_end > now
+    sync_is_recent = now - last_sync <= OFFLINE_SUBSCRIPTION_GRACE_SECONDS
+    if unlimited_active and subscription_not_expired and sync_is_recent:
+        state["source"] = "local"
+        return True, state, "License server was unreachable; using cached monthly unlimited entitlement."
+
+    state["source"] = "local"
+    return True, state, "License server was unreachable; using cached license balance."
+
+
 def consume_use():
     remote = _request("consume")
     if remote.get("ok"):
