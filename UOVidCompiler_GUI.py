@@ -99,9 +99,15 @@ class CompilerGuiLogHandler(logging.Handler):
 
 class UOVidCompilerGUI:
     # Version info for auto-updates
-    VERSION = "1.3.3"  # Update this when releasing new versions
+    VERSION = "1.3.4"  # Update this when releasing new versions
     RELEASE_EXE_NAME = "Auto_Video_Compiler.exe"
     GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"  # GitHub repo for auto-updates
+    UPDATE_USER_AGENT = "AutoVideoCompiler-Updater"
+    MIN_UPDATE_BYTES = 40 * 1024 * 1024  # reject HTML/error pages masquerading as .exe
+    GITHUB_API_HEADERS = {
+        "User-Agent": UPDATE_USER_AGENT,
+        "Accept": "application/vnd.github+json",
+    }
     VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v')
     INTRO_EXTENSIONS = VIDEO_EXTENSIONS + ('.gif',)
     STOCK_INTRO_BASENAME = 'StockDefault'
@@ -178,6 +184,12 @@ class UOVidCompilerGUI:
         self.clip_trim_inputs = {}
         self.clip_preview_window = None
         self.clip_preview_thumb = None
+        self._update_prompt_shown = False
+        self._update_download_active = False
+        self._update_progress_window = None
+        self._update_progress_var = None
+        self._update_progress_label = None
+        self.updater_batch_path = None
         
         # Set icon IMMEDIATELY for taskbar
         self.set_taskbar_icon()
@@ -3743,139 +3755,265 @@ To send a donation:
         widget.bind('<Enter>', on_enter)
         widget.bind('<Leave>', on_leave)
 
-    def check_for_updates(self):
-        """Check GitHub for newer version and prompt user to update"""
-        try:
-            # Only check if running from executable (not development)
-            if not getattr(sys, 'frozen', False):
-                return
-            
-            api_url = f"https://api.github.com/repos/{self.GITHUB_REPO}/releases/latest"
-            
-            # Make request with timeout
-            req = urllib.request.Request(api_url, headers={'User-Agent': 'BMagic-AutoVidCompiler'})
-            with urllib.request.urlopen(req, timeout=5) as response:
-                data = json.loads(response.read().decode())
-                
-            latest_version = data['tag_name'].lstrip('v')  # Remove 'v' prefix if present
-            
-            # Compare versions
-            if self.compare_versions(latest_version, self.VERSION):
-                # New version available
-                download_url = None
-                preferred_names = (
-                    self.RELEASE_EXE_NAME,
-                    self.RELEASE_EXE_NAME.lower(),
-                    'Auto_Video_Compiler.exe',
+    def _github_request(self, url, timeout=30):
+        """GitHub API or release download with required headers."""
+        req = urllib.request.Request(url, headers={**self.GITHUB_API_HEADERS, "User-Agent": self.UPDATE_USER_AGENT})
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    def _find_release_exe_asset(self, release_data):
+        """Return (download_url, asset_name, expected_size) for the release exe only."""
+        for asset in release_data.get("assets", []):
+            name = str(asset.get("name", "") or "")
+            if name == self.RELEASE_EXE_NAME:
+                return (
+                    asset.get("browser_download_url"),
+                    name,
+                    int(asset.get("size", 0) or 0),
                 )
-                for asset in data.get('assets', []):
-                    name = asset.get('name', '')
-                    if name in preferred_names:
-                        download_url = asset['browser_download_url']
-                        break
-                if not download_url:
-                    for asset in data.get('assets', []):
-                        if asset['name'].endswith('.exe'):
-                            download_url = asset['browser_download_url']
-                            break
-                
-                if download_url:
-                    # Show update prompt on main thread
-                    self.root.after(0, lambda: self.prompt_update(latest_version, download_url, data.get('body', '')))
-                
-        except Exception as e:
-            # Silently fail - don't interrupt user experience for update check failures
-            print(f"Update check failed: {e}")
-    
-    def compare_versions(self, version1, version2):
-        """Compare two version strings (returns True if version1 > version2)"""
+        return None, None, 0
+
+    def _validate_downloaded_update(self, path, expected_size=0):
+        """Ensure the downloaded file is a real PE executable, not an HTML error page."""
+        if not os.path.isfile(path):
+            return False, "Downloaded file is missing."
+        size = os.path.getsize(path)
+        if size < self.MIN_UPDATE_BYTES:
+            return False, f"Download looks incomplete ({size:,} bytes). Check your connection and try again."
+        if expected_size and size < int(expected_size * 0.95):
+            return False, f"Download size mismatch (got {size:,} bytes, expected about {expected_size:,})."
+        with open(path, "rb") as handle:
+            if handle.read(2) != b"MZ":
+                return False, "Download is not a valid Windows program file. Try again or install manually from GitHub."
+        return True, ""
+
+    def check_for_updates(self):
+        """Check GitHub for newer version and prompt user to update."""
         try:
-            v1_parts = [int(x) for x in version1.split('.')]
-            v2_parts = [int(x) for x in version2.split('.')]
-            
-            # Pad shorter version with zeros
+            if not getattr(sys, "frozen", False):
+                return
+            if self._update_download_active:
+                return
+
+            api_url = f"https://api.github.com/repos/{self.GITHUB_REPO}/releases/latest"
+            with self._github_request(api_url, timeout=15) as response:
+                data = json.loads(response.read().decode())
+
+            latest_version = str(data.get("tag_name", "")).lstrip("vV")
+            if not self.compare_versions(latest_version, self.VERSION):
+                return
+
+            download_url, asset_name, expected_size = self._find_release_exe_asset(data)
+            if not download_url:
+                print("Update check: release has no Auto_Video_Compiler.exe asset")
+                return
+
+            self.root.after(
+                0,
+                lambda: self.prompt_update(latest_version, download_url, data.get("body", ""), expected_size),
+            )
+        except Exception as e:
+            print(f"Update check failed: {e}")
+
+    def compare_versions(self, version1, version2):
+        """Compare two version strings (returns True if version1 > version2)."""
+        try:
+            v1_parts = [int(x) for x in str(version1).split(".")]
+            v2_parts = [int(x) for x in str(version2).split(".")]
             while len(v1_parts) < len(v2_parts):
                 v1_parts.append(0)
             while len(v2_parts) < len(v1_parts):
                 v2_parts.append(0)
-            
             return v1_parts > v2_parts
-        except:
+        except (TypeError, ValueError):
             return False
-    
-    def prompt_update(self, new_version, download_url, changelog):
-        """Show update dialog and handle download"""
+
+    def prompt_update(self, new_version, download_url, changelog, expected_size=0):
+        """Show update dialog and handle download."""
+        if self._update_prompt_shown or self._update_download_active:
+            return
+        self._update_prompt_shown = True
+
         message = f"New version available: v{new_version}\n"
         message += f"Current version: v{self.VERSION}\n\n"
-        
         if changelog:
-            # Show first 200 chars of changelog
             message += f"Changes:\n{changelog[:200]}"
             if len(changelog) > 200:
                 message += "...\n"
-        
-        message += "\n\nWould you like to download and install the update?"
-        
+        message += (
+            "\n\nDownload happens in the background (~200 MB). "
+            "Close the app when prompted to finish installing.\n\n"
+            "Download and install the update now?"
+        )
+
         if messagebox.askyesno("Update Available", message):
-            self.download_and_install_update(download_url)
-    
-    def download_and_install_update(self, download_url):
-        """Download and install update"""
+            self._update_download_active = True
+            threading.Thread(
+                target=self._download_update_worker,
+                args=(download_url, new_version, expected_size),
+                daemon=True,
+            ).start()
+        else:
+            self._update_prompt_shown = False
+
+    def _show_update_progress(self, title="Downloading update"):
+        """Show a small progress window on the main thread."""
+        if self._update_progress_window is not None:
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.resizable(False, False)
+        window.transient(self.root)
+        window.grab_set()
+        self._update_progress_var = tk.DoubleVar(value=0)
+        ttk.Label(window, text="Downloading update (~200 MB)...", padding=12).pack()
+        self._update_progress_label = ttk.Label(window, text="Starting...", padding=(12, 0))
+        self._update_progress_label.pack()
+        ttk.Progressbar(window, variable=self._update_progress_var, maximum=100, length=320).pack(padx=12, pady=12)
+        window.update_idletasks()
+        self._center_toplevel(window)
+        self._update_progress_window = window
+
+    def _center_toplevel(self, window):
+        window.update_idletasks()
+        width = window.winfo_width()
+        height = window.winfo_height()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+        window.geometry(f"+{x}+{y}")
+
+    def _set_update_progress(self, percent, label):
+        def apply():
+            if self._update_progress_var is not None:
+                self._update_progress_var.set(max(0, min(100, percent)))
+            if self._update_progress_label is not None:
+                self._update_progress_label.configure(text=label)
+        self.root.after(0, apply)
+
+    def _close_update_progress(self):
+        def apply():
+            if self._update_progress_window is not None:
+                try:
+                    self._update_progress_window.grab_release()
+                    self._update_progress_window.destroy()
+                except tk.TclError:
+                    pass
+                self._update_progress_window = None
+            self._update_progress_var = None
+            self._update_progress_label = None
+        self.root.after(0, apply)
+
+    def _download_update_worker(self, download_url, new_version, expected_size=0):
+        """Background download with validation and a safe swap-on-exit installer."""
+        temp_path = None
         try:
-            self.log_status("[UPDATE] Downloading update...")
-            
-            # Get current executable path
-            current_exe = sys.executable if getattr(sys, 'frozen', False) else __file__
-            
-            # Download next to current exe with .new extension
-            new_exe_path = current_exe.replace('.exe', '_NEW.exe')
-            
-            with urllib.request.urlopen(download_url, timeout=60) as response:
-                with open(new_exe_path, 'wb') as out_file:
-                    shutil.copyfileobj(response, out_file)
-            
-            self.log_status("[OK] Update downloaded successfully!")
-            
-            # Create batch file updater (works better than Python for .exe replacement)
+            self.root.after(0, self._show_update_progress)
+            self._set_update_progress(0, "Connecting to GitHub...")
+
+            current_exe = os.path.abspath(sys.executable)
+            install_dir = os.path.dirname(current_exe)
+            exe_name = os.path.basename(current_exe)
+            staged_name = f"{os.path.splitext(exe_name)[0]}_NEW.exe"
+            staged_path = os.path.join(install_dir, staged_name)
+
+            for stale in (staged_path, os.path.join(install_dir, "updater.bat")):
+                if os.path.exists(stale):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+
+            temp_fd, temp_path = tempfile.mkstemp(prefix="avc_update_", suffix=".part", dir=install_dir)
+            os.close(temp_fd)
+
+            req = urllib.request.Request(download_url, headers={"User-Agent": self.UPDATE_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=600) as response:
+                total = int(response.headers.get("Content-Length", 0) or expected_size or 0)
+                downloaded = 0
+                chunk_size = 1024 * 256
+                with open(temp_path, "wb") as out_file:
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            percent = (downloaded / total) * 100
+                            label = f"{downloaded // (1024 * 1024)} / {total // (1024 * 1024)} MB"
+                        else:
+                            percent = min(99, downloaded // (2 * 1024 * 1024))
+                            label = f"{downloaded // (1024 * 1024)} MB downloaded"
+                        self._set_update_progress(percent, label)
+
+            ok, reason = self._validate_downloaded_update(temp_path, expected_size=expected_size)
+            if not ok:
+                raise RuntimeError(reason)
+
+            if os.path.exists(staged_path):
+                os.remove(staged_path)
+            os.replace(temp_path, staged_path)
+            temp_path = None
+
+            batch_path = os.path.join(install_dir, "updater.bat")
+            log_path = os.path.join(install_dir, "update_install.log")
             batch_script = f'''@echo off
-REM Wait for app to fully close and release all file locks
+setlocal
+cd /d "%~dp0"
+echo [%date% %time%] Starting update to v{new_version}>>"{log_path}"
 timeout /t 3 /nobreak >nul
-
-REM Try to delete old exe, retry if locked
-:retry_delete
-del /f /q "{current_exe}" 2>nul
-if exist "{current_exe}" (
-    timeout /t 1 /nobreak >nul
-    goto retry_delete
+if exist "{exe_name}.bak" del /f /q "{exe_name}.bak"
+if exist "{exe_name}" ren "{exe_name}" "{exe_name}.bak"
+move /y "{staged_name}" "{exe_name}"
+if errorlevel 1 (
+  echo [%date% %time%] Update move failed>>"{log_path}"
+  if exist "{exe_name}.bak" ren "{exe_name}.bak" "{exe_name}"
+  exit /b 1
 )
-
-REM Move new version to replace old
-move /y "{new_exe_path}" "{current_exe}"
-
-REM Wait a moment before restarting to ensure file system is ready
-timeout /t 1 /nobreak >nul
-
-REM Start the updated version
-start "" "{current_exe}"
-
-REM Clean up this batch file
+if exist "{exe_name}.bak" del /f /q "{exe_name}.bak"
+start "" "%~dp0{exe_name}"
+echo [%date% %time%] Update complete>>"{log_path}"
 del "%~f0"
 '''
-            
-            batch_path = os.path.join(os.path.dirname(current_exe), "updater.bat")
-            with open(batch_path, 'w') as f:
-                f.write(batch_script)
-            
-            messagebox.showinfo("Update Ready", 
-                              "Update will be installed when you close the application.\n"
-                              "The program will restart automatically.")
-            
-            # Store batch path for execution on close
+            with open(batch_path, "w", encoding="utf-8", newline="\r\n") as handle:
+                handle.write(batch_script)
+
             self.updater_batch_path = batch_path
-            
+            self.log_status(f"[UPDATE] v{new_version} downloaded and ready to install on exit.")
+
+            def notify_ready():
+                self._close_update_progress()
+                messagebox.showinfo(
+                    "Update Ready",
+                    f"Version {new_version} downloaded successfully.\n\n"
+                    "Close Auto Video Compiler to install the update. "
+                    "The app will restart automatically.\n\n"
+                    "If anything goes wrong, download the latest .exe from GitHub Releases.",
+                )
+
+            self.root.after(0, notify_ready)
         except Exception as e:
-            self.log_error(f"Update download failed: {e}")
-            messagebox.showerror("Update Failed", f"Could not download update:\n{e}")
+            def notify_failed():
+                self._close_update_progress()
+                self.log_error(f"Update download failed: {e}")
+                messagebox.showerror(
+                    "Update Failed",
+                    f"Could not download the update:\n{e}\n\n"
+                    "Install manually from:\n"
+                    f"https://github.com/{self.GITHUB_REPO}/releases/latest",
+                )
+                self._update_prompt_shown = False
+                self._update_download_active = False
+
+            self.root.after(0, notify_failed)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            if not self.updater_batch_path:
+                self._update_download_active = False
 
     def on_closing(self):
         """Handle application closing"""
