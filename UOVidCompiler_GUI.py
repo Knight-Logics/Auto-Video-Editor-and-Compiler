@@ -99,7 +99,8 @@ class CompilerGuiLogHandler(logging.Handler):
 
 class UOVidCompilerGUI:
     # Version info for auto-updates
-    VERSION = "1.3.1"  # Update this when releasing new versions
+    VERSION = "1.3.2"  # Update this when releasing new versions
+    RELEASE_EXE_NAME = "Auto_Video_Compiler.exe"
     GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"  # GitHub repo for auto-updates
     VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v')
     INTRO_EXTENSIONS = VIDEO_EXTENSIONS + ('.gif',)
@@ -576,6 +577,16 @@ class UOVidCompilerGUI:
                        fieldbackground=self.colors['entry_bg'],
                        foreground=self.colors['fg'],
                        borderwidth=1)
+
+        # High-contrast yellow progress bar (default clam grey is hard to see on charcoal UI)
+        style.configure(
+            'Yellow.Horizontal.TProgressbar',
+            troughcolor='#2a2a2a',
+            background='#F5C518',
+            bordercolor='#404040',
+            lightcolor='#FFE566',
+            darkcolor='#C9A000',
+        )
         
     def create_widgets(self):
         """Create and arrange GUI widgets"""
@@ -724,35 +735,32 @@ class UOVidCompilerGUI:
         return
 
     def create_donation_support_section(self, parent):
-        """Create a separate optional-donation area away from the licensing header."""
+        """Optional donations: labels sit directly beside payment icons (same row)."""
         support_frame = tk.Frame(parent, bg=self.colors['frame_bg'])
         support_frame.pack(fill='x', pady=(8, 0))
 
-        message_frame = tk.Frame(support_frame, bg=self.colors['frame_bg'])
-        message_frame.pack(side='left', fill='x', expand=True)
+        row = tk.Frame(support_frame, bg=self.colors['frame_bg'])
+        row.pack(fill='x', anchor='w')
 
         tk.Label(
-            message_frame,
-            text="Optional donations",
+            row,
+            text="Optional donations:",
             bg=self.colors['frame_bg'],
             fg=self.colors['label_color'],
             font=('Segoe UI', 9, 'bold'),
             anchor='w',
-        ).pack(anchor='w')
+        ).pack(side='left', padx=(0, 6))
 
         tk.Label(
-            message_frame,
-            text="Donations are just extra support for development. They do not add credits or unlock packs/monthly access.",
+            row,
+            text="Extra support only — not credits or monthly access.",
             bg=self.colors['frame_bg'],
             fg='#c6d0dc',
             font=('Segoe UI', 8),
             anchor='w',
-            justify='left',
-            wraplength=720,
-        ).pack(anchor='w', pady=(2, 0))
+        ).pack(side='left', padx=(0, 10))
 
-        icon_row = tk.Frame(support_frame, bg=self.colors['frame_bg'])
-        icon_row.pack(side='right', anchor='n', padx=(12, 0))
+        icon_row = row
 
         payment_methods = [
             ('Venmo', 'venmo', lambda: self.open_venmo()),
@@ -1096,6 +1104,7 @@ class UOVidCompilerGUI:
             variable=self.progress_var,
             maximum=100,
             mode='determinate',
+            style='Yellow.Horizontal.TProgressbar',
         )
         self.progress_bar.pack(fill='x')
         tk.Label(
@@ -3758,10 +3767,21 @@ To send a donation:
             if self.compare_versions(latest_version, self.VERSION):
                 # New version available
                 download_url = None
+                preferred_names = (
+                    self.RELEASE_EXE_NAME,
+                    self.RELEASE_EXE_NAME.lower(),
+                    'Auto_Video_Compiler.exe',
+                )
                 for asset in data.get('assets', []):
-                    if asset['name'].endswith('.exe'):
+                    name = asset.get('name', '')
+                    if name in preferred_names:
                         download_url = asset['browser_download_url']
                         break
+                if not download_url:
+                    for asset in data.get('assets', []):
+                        if asset['name'].endswith('.exe'):
+                            download_url = asset['browser_download_url']
+                            break
                 
                 if download_url:
                     # Show update prompt on main thread

@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='BMagic_AutoVidCompiler_PERFECT',
+    name='Auto_Video_Compiler',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
