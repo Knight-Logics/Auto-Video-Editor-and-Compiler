@@ -1,15 +1,16 @@
-# Stock intro video
+# Intro videos folder
 
-This folder should contain **one** bundled intro file:
+Place intro videos and GIFs here, or use **Add Intro/GIF...** in the app.
+
+## Bundled stock intro
 
 - `StockDefault.mp4` (or the same basename with another supported extension)
+- Choose **Stock** in the dropdown to use it
 
-## GUI options
+## Your own intros
 
-- **None** — no intro (default)
-- **Stock** — use the stock intro file
-- **Random** — uses the same stock intro file
-
-Other intro files in this folder are ignored by the app.
+- Add files with **Add Intro/GIF...** or copy them into this folder via **Open folder**
+- Each file appears in the **Intro Video** dropdown by name (without extension)
+- **Random** picks any intro file in this folder
 
 Supported formats: `.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`, `.m4v`, `.gif`

@@ -99,7 +99,7 @@ class CompilerGuiLogHandler(logging.Handler):
 
 class UOVidCompilerGUI:
     # Version info for auto-updates
-    VERSION = "1.3.4"  # Update this when releasing new versions
+    VERSION = "1.3.5"  # Update this when releasing new versions
     RELEASE_EXE_NAME = "Auto_Video_Compiler.exe"
     GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"  # GitHub repo for auto-updates
     UPDATE_USER_AGENT = "AutoVideoCompiler-Updater"
@@ -359,10 +359,6 @@ class UOVidCompilerGUI:
             for name in os.listdir(source_dir):
                 if not name.lower().endswith(extensions):
                     continue
-                if folder_name == "Intros":
-                    stem = os.path.splitext(name)[0]
-                    if stem != self.STOCK_INTRO_BASENAME:
-                        continue
                 src = os.path.join(source_dir, name)
                 dst = os.path.join(target_dir, name)
                 if os.path.isfile(src) and not os.path.exists(dst):
@@ -673,7 +669,7 @@ class UOVidCompilerGUI:
             "• Bottom-right on each card: seconds from the end of that clip\n"
             "• Drag thumbnails to reorder; use timeframe bubbles to filter\n"
             "• Browse for input/output folders; Add Music… or Open folder for tracks\n"
-            "• Intro Video: None, Stock, or Random (bundled stock intro)\n"
+            "• Intro Video: add your own with Add Intro/GIF… or Open folder\n"
             "• RUN VIDEO COMPILER builds your video; STOP cancels (no credit used)"
         )
         ttk.Label(
@@ -974,12 +970,31 @@ class UOVidCompilerGUI:
         return selection
 
     def get_available_intros(self):
-        """Intro choices: None (default), Stock, or Random — stock file only."""
-        options = ["None"]
-        if self.stock_intro_available():
-            options.append(self.INTRO_OPTION_STOCK)
-        options.append("[RANDOM] Random")
-        return options
+        """Intro choices: None, Stock (bundled), Random, and any files in the Intros folder."""
+        try:
+            intro_dir = self.get_intro_dir()
+            if not os.path.isdir(intro_dir):
+                return ["None", "[RANDOM] Random"]
+
+            custom_names = []
+            stock_found = False
+            for file in os.listdir(intro_dir):
+                if not file.lower().endswith(self.INTRO_EXTENSIONS):
+                    continue
+                stem = os.path.splitext(file)[0]
+                if stem == self.STOCK_INTRO_BASENAME:
+                    stock_found = True
+                else:
+                    custom_names.append(stem)
+
+            options = ["None"]
+            if stock_found:
+                options.append(self.INTRO_OPTION_STOCK)
+            options.append("[RANDOM] Random")
+            options.extend(sorted(custom_names))
+            return options if options else ["None", "[RANDOM] Random"]
+        except Exception:
+            return ["None", "[RANDOM] Random"]
     
     def create_action_section(self, parent):
         """Create action buttons section with video configuration options"""
@@ -1060,6 +1075,30 @@ class UOVidCompilerGUI:
         else:
             self.intro_combo.current(0)
         self.intro_combo.bind('<<ComboboxSelected>>', lambda _event: self.save_config())
+        intro_tools = ttk.Frame(options_container, style='Custom.TFrame')
+        intro_tools.grid(row=2, column=2, sticky='w', padx=5, pady=(3, 0))
+        tk.Button(
+            intro_tools,
+            text="Add Intro/GIF...",
+            command=self.add_intro_files,
+            font=('Segoe UI', 8),
+            bg=self.colors['button'],
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=6,
+            pady=2,
+        ).pack(side='left')
+        intro_link = tk.Label(
+            intro_tools,
+            text="Open folder",
+            bg=self.colors['frame_bg'],
+            fg=self.colors['accent'],
+            cursor='hand2',
+            font=('Segoe UI', 8, 'underline'),
+        )
+        intro_link.pack(side='left', padx=(8, 0))
+        intro_link.bind('<Button-1>', lambda _event: self.open_intro_folder())
 
         self.create_clip_selection_panel(action_frame)
 
@@ -1290,10 +1329,12 @@ Automatically combines multiple short clips into one polished video with intro a
    * Music loops/extends to match total video length
    * Mixed at lower volume so original audio stays clear
 
-[INTRO] INTRO VIDEO: Optional stock intro at the start of the compilation
+[INTRO] INTRO VIDEO: Optional intro at the start of the compilation
    * None = no intro (default)
-   * Stock = bundled stock intro video
-   * Random = stock intro (same file; kept for a simple random option)
+   * Stock = bundled stock intro (StockDefault)
+   * Random = random file from your Intros folder
+   * Or pick a specific intro you added (Add Intro/GIF... / Open folder)
+   * Formats: MP4, AVI, MOV, MKV, WEBM, M4V, GIF
    * Intro duration matches your trim seconds setting
 
 [ORDER] CLIP ORDER: Choose newest-first, oldest-first, filename order, or save a custom order
@@ -1351,9 +1392,14 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         return []
         
     def get_intro_files(self):
-        """Stock intro file only (used for path summary)."""
-        stock_path = self.get_stock_intro_path()
-        return [os.path.basename(stock_path)] if stock_path else []
+        """All intro media files in the Intros folder (for path summary)."""
+        intro_dir = self.get_intro_dir()
+        if not os.path.isdir(intro_dir):
+            return []
+        return [
+            name for name in os.listdir(intro_dir)
+            if name.lower().endswith(self.INTRO_EXTENSIONS)
+        ]
 
     def refresh_license_status(self):
         """Refresh license/trial status from the server, falling back to signed local state."""

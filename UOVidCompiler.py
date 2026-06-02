@@ -5,7 +5,7 @@ A portable video compilation script for Ultima Online gameplay videos.
 Compiles the last 5 seconds of videos with music and intro support.
 
 [MUSIC] MUSIC INCLUDED: 10 royalty-free background tracks ready to use!
-[VIDEO] STOCK INTRO: One bundled stock intro video (None / Stock / Random in the GUI).
+[VIDEO] INTRO: Optional intro from your Intros folder (None / Stock / Random / specific file).
 [TOOLS] FFMPEG INCLUDED: No need to download or install FFmpeg separately!
 
 Setup Instructions:
@@ -969,7 +969,7 @@ STOCK_INTRO_BASENAME = "StockDefault"
 
 
 def resolve_stock_intro_path():
-    """Only the bundled stock intro is supported."""
+    """Return the bundled StockDefault intro file, if present."""
     if not os.path.exists(CONFIG["intro_folder"]):
         return None
     for ext in CONFIG["intro_extensions"]:
@@ -979,11 +979,27 @@ def resolve_stock_intro_path():
     return None
 
 
+def list_intro_media_paths():
+    """All intro media files in the intro folder."""
+    if not os.path.exists(CONFIG["intro_folder"]):
+        return []
+    intro_files = []
+    for ext in CONFIG["intro_extensions"]:
+        pattern = os.path.join(CONFIG["intro_folder"], f"*{ext}")
+        intro_files.extend(glob.glob(pattern))
+    return intro_files
+
+
 def select_random_intro():
-    """Random intro uses the stock intro file only."""
+    """Select a random intro video or GIF from the intro folder."""
     if not CONFIG["use_intro"]:
         return None
-    return resolve_stock_intro_path()
+    intro_files = list_intro_media_paths()
+    if not intro_files:
+        return None
+    selected = random.choice(intro_files)
+    logger.info(f"Using random intro: {os.path.basename(selected)}")
+    return selected
 
 def validate_and_convert_audio(file_path, temp_dir):
     """
@@ -1406,25 +1422,35 @@ def select_random_music():
 
 
 def select_intro_video():
-    """Select intro video: None, stock file only, or random (stock file only)."""
-    selection = CONFIG.get("intro_selection", "")
+    """Select intro video: None, StockDefault, random, or a specific file from the GUI."""
+    selection = str(CONFIG.get("intro_selection", "") or "").strip()
 
     if selection == "None":
         logger.info("Intro disabled (None selected)")
         return None
 
-    stock_path = resolve_stock_intro_path()
-    if not stock_path:
-        logger.warning("Stock intro file not found in intro folder")
+    if not os.path.exists(CONFIG["intro_folder"]):
         return None
 
-    if selection in (STOCK_INTRO_BASENAME, "[RANDOM] Random"):
-        label = "stock" if selection == STOCK_INTRO_BASENAME else "random (stock)"
-        logger.info(f"Using {label} intro: {os.path.basename(stock_path)}")
-        return stock_path
+    if selection == "[RANDOM] Random":
+        return select_random_intro()
 
-    logger.warning(f"Unknown intro selection '{selection}', using stock intro")
-    return stock_path
+    if selection in (STOCK_INTRO_BASENAME, "Stock"):
+        stock_path = resolve_stock_intro_path()
+        if stock_path:
+            logger.info(f"Using stock intro: {os.path.basename(stock_path)}")
+            return stock_path
+        logger.warning("Stock intro file not found in intro folder")
+        return select_random_intro()
+
+    for ext in CONFIG["intro_extensions"]:
+        intro_file = os.path.join(CONFIG["intro_folder"], f"{selection}{ext}")
+        if os.path.exists(intro_file):
+            logger.info(f"Using selected intro: {selection}")
+            return intro_file
+
+    logger.warning(f"Intro '{selection}' not found, falling back to random")
+    return select_random_intro()
 
 
 def cleanup_temp_files(temp_files):

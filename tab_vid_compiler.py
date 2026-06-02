@@ -357,20 +357,25 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             return ['None', '[RANDOM] Random']
     
     def get_available_intros(self):
-        """None, Stock, or Random — stock intro file only."""
+        """None, Stock, Random, and any intro files in the Intros folder."""
         intro_dir = os.path.join(os.path.dirname(__file__), "Intros")
+        custom_names = []
         stock_found = False
         if os.path.isdir(intro_dir):
             for file in os.listdir(intro_dir):
-                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v', '.gif')):
-                    if os.path.splitext(file)[0] == 'StockDefault':
-                        stock_found = True
-                        break
+                if not file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v', '.gif')):
+                    continue
+                stem = os.path.splitext(file)[0]
+                if stem == 'StockDefault':
+                    stock_found = True
+                else:
+                    custom_names.append(stem)
         options = ['None']
         if stock_found:
             options.append('Stock')
         options.append('[RANDOM] Random')
-        return options
+        options.extend(sorted(custom_names))
+        return options if options else ['None', '[RANDOM] Random']
     
     def update_paths_display(self):
         """Update the current paths display"""
