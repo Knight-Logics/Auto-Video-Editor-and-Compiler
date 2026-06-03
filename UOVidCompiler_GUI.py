@@ -52,6 +52,13 @@ try:
 except ImportError:
     autovid_license = None
 
+try:
+    import intro_creator
+    INTRO_CREATOR_AVAILABLE = True
+except ImportError:
+    intro_creator = None
+    INTRO_CREATOR_AVAILABLE = False
+
 
 def get_autovid_license() -> ModuleType:
     if autovid_license is None:
@@ -99,7 +106,7 @@ class CompilerGuiLogHandler(logging.Handler):
 
 class UOVidCompilerGUI:
     # Version info for auto-updates
-    VERSION = "1.3.6"  # Update this when releasing new versions
+    VERSION = "1.3.7"  # Update this when releasing new versions
     RELEASE_EXE_NAME = "Auto_Video_Compiler.exe"
     GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"  # GitHub repo for auto-updates
     UPDATE_USER_AGENT = "AutoVideoCompiler-Updater"
@@ -167,6 +174,9 @@ class UOVidCompilerGUI:
         self.custom_order_file = os.path.join(self.storage_dir, "custom_clip_order.json")
         self.preview_process = None
         self.stop_requested = False
+        self._shutdown_in_progress = False
+        self._create_intro_window = None
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_text_var = tk.StringVar(value="Idle")
         self.status_text = None
@@ -219,6 +229,8 @@ class UOVidCompilerGUI:
         self.create_widgets()
         self.load_saved_paths()
         self.log_status(f"[LOG] GUI diagnostics log: {self.gui_log_path}")
+        # Defer until after the status widget is fully initialized (avoids cp1252 console print crashes).
+        self.root.after(0, self._publish_gui_process_identity)
         
         # Start folder monitoring (checks every 5 seconds)
         self.start_folder_monitoring()
@@ -326,6 +338,50 @@ class UOVidCompilerGUI:
 
     def get_intro_dir(self):
         return os.path.join(self.storage_dir, "Intros")
+
+    def get_sound_effects_dir(self):
+        for base in (self.bundle_dir, os.path.dirname(os.path.abspath(__file__))):
+            path = os.path.join(base, "Sound Effects")
+            if os.path.isdir(path):
+                return path
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "Sound Effects")
+
+    def get_intro_creator_search_roots(self):
+        return [self.bundle_dir, os.path.dirname(os.path.abspath(__file__))]
+
+    def get_gui_pid_file(self):
+        return os.path.join(self.storage_dir, "gui.pid")
+
+    def _publish_gui_process_identity(self):
+        """Write PID so Task Manager / scripts can identify this GUI among other Python apps."""
+        pid = os.getpid()
+        pid_path = self.get_gui_pid_file()
+        try:
+            os.makedirs(self.storage_dir, exist_ok=True)
+            with open(pid_path, "w", encoding="utf-8") as handle:
+                handle.write(f"{pid}\n{os.path.abspath(__file__)}\n")
+        except OSError:
+            pass
+
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                ctypes.windll.kernel32.SetConsoleTitleW(f"Auto Video Compiler GUI (PID {pid})")
+            except Exception:
+                pass
+
+        self.log_status(
+            f"[APP] GUI process ID {pid}. In Task Manager use Details > Command line "
+            f"contains UOVidCompiler_GUI.py (not other Python programs)."
+        )
+
+    def _remove_gui_pid_file(self):
+        try:
+            if os.path.isfile(self.get_gui_pid_file()):
+                os.remove(self.get_gui_pid_file())
+        except OSError:
+            pass
 
     def get_thumbnail_dir(self):
         path = os.path.join(self.storage_dir, "thumbnail-cache")
@@ -1113,6 +1169,18 @@ class UOVidCompilerGUI:
             padx=6,
             pady=2,
         ).pack(side='left')
+        tk.Button(
+            intro_tools,
+            text="Create Intro...",
+            command=self.show_create_intro_dialog,
+            font=('Segoe UI', 8),
+            bg=self.colors['accent'],
+            fg='white',
+            relief='raised',
+            cursor='hand2',
+            padx=6,
+            pady=2,
+        ).pack(side='left', padx=(6, 0))
         intro_link = tk.Label(
             intro_tools,
             text="Open folder",
@@ -1869,6 +1937,395 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             (("Audio files", "*.mp3 *.wav *.m4a *.ogg *.flac *.aac"), ("All files", "*.*")),
             self.refresh_music_list,
         )
+
+    def show_create_intro_dialog(self):
+        """Open the custom intro builder (template + animated text + sound)."""
+        if not INTRO_CREATOR_AVAILABLE or intro_creator is None:
+            messagebox.showerror("Intro Creator", "The intro creator module could not be loaded.")
+            return
+        if not self.get_ffmpeg_path():
+            messagebox.showerror("Intro Creator", "FFmpeg was not found. Cannot build intro videos.")
+            return
+
+        if self._create_intro_window is not None:
+            try:
+                if self._create_intro_window.winfo_exists():
+                    self._create_intro_window.lift()
+                    self._create_intro_window.focus_force()
+                    return
+            except tk.TclError:
+                self._create_intro_window = None
+
+        window = tk.Toplevel(self.root)
+        self._create_intro_window = window
+        window.title("Create Intro Video")
+        window.transient(self.root)
+        window.configure(bg=self.colors['frame_bg'])
+        self._center_toplevel(window, width=1020, height=680)
+
+        content = ttk.Frame(window, style='Custom.TFrame', padding=12)
+        content.pack(fill='both', expand=True)
+
+        body = ttk.Frame(content, style='Custom.TFrame')
+        body.pack(side='left', fill='both', expand=True, padx=(0, 12))
+
+        preview_panel = ttk.Frame(content, style='Custom.TFrame')
+        preview_panel.pack(side='right', fill='y')
+        ttk.Label(preview_panel, text="Preview", style='Heading.TLabel', font=('Segoe UI', 10, 'bold')).pack(
+            anchor='w', pady=(0, 6)
+        )
+        preview_image_label = tk.Label(
+            preview_panel,
+            bg='#101010',
+            relief='sunken',
+            borderwidth=2,
+            width=480,
+            height=270,
+        )
+        preview_image_label.pack()
+        preview_caption_var = tk.StringVar(
+            value="Shows template frame with text position (matches final overlay)."
+        )
+        ttk.Label(
+            preview_panel,
+            textvariable=preview_caption_var,
+            style='Info.TLabel',
+            wraplength=500,
+            justify='left',
+        ).pack(anchor='w', pady=(8, 0))
+
+        preview_state = {"frame": None, "frame_key": None, "photo": None, "busy": False}
+        ffprobe_path = os.path.join(os.path.dirname(self.get_ffmpeg_path()), "ffprobe.exe")
+        search_roots = self.get_intro_creator_search_roots()
+        preview_after_id = {"id": None}
+
+        def close_create_intro_window():
+            if preview_after_id["id"] is not None:
+                try:
+                    window.after_cancel(preview_after_id["id"])
+                except tk.TclError:
+                    pass
+                preview_after_id["id"] = None
+            try:
+                window.grab_release()
+            except tk.TclError:
+                pass
+            self._create_intro_window = None
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", close_create_intro_window)
+
+        ttk.Label(body, text="Template", style='Info.TLabel').grid(row=0, column=0, sticky='w')
+        template_var = tk.StringVar(value=intro_creator.INTRO_TEMPLATE_NAMES[0])
+        ttk.Combobox(
+            body,
+            textvariable=template_var,
+            values=list(intro_creator.INTRO_TEMPLATE_NAMES),
+            state='readonly',
+            width=24,
+        ).grid(row=0, column=1, columnspan=2, sticky='ew', pady=(0, 6))
+
+        ttk.Label(body, text="Text appears (sec before end)", style='Info.TLabel').grid(row=1, column=0, sticky='w')
+        seconds_var = tk.StringVar(value=str(intro_creator.DEFAULT_SECONDS_FROM_END))
+        ttk.Spinbox(body, from_=0.3, to=15.0, increment=0.1, textvariable=seconds_var, width=10).grid(
+            row=1, column=1, sticky='w', pady=(0, 6)
+        )
+        ttk.Label(body, text="(1.5 recommended)", style='Info.TLabel').grid(row=1, column=2, sticky='w')
+
+        ttk.Label(body, text="Font style", style='Info.TLabel').grid(row=2, column=0, sticky='w')
+        font_style_var = tk.StringVar(value="Arial Bold")
+        ttk.Combobox(
+            body,
+            textvariable=font_style_var,
+            values=list(intro_creator.FONT_STYLES.keys()),
+            state='readonly',
+            width=24,
+        ).grid(row=2, column=1, columnspan=2, sticky='ew', pady=(0, 6))
+
+        ttk.Label(body, text="Text size", style='Info.TLabel').grid(row=3, column=0, sticky='w')
+        font_size_var = tk.StringVar(value="Large")
+        ttk.Combobox(
+            body,
+            textvariable=font_size_var,
+            values=list(intro_creator.FONT_SIZES.keys()),
+            state='readonly',
+            width=24,
+        ).grid(row=3, column=1, columnspan=2, sticky='ew', pady=(0, 6))
+
+        ttk.Label(body, text="Text animation", style='Info.TLabel').grid(row=4, column=0, sticky='w')
+        animation_var = tk.StringVar(value=intro_creator.ANIMATIONS[0])
+        ttk.Combobox(
+            body,
+            textvariable=animation_var,
+            values=list(intro_creator.ANIMATIONS),
+            state='readonly',
+            width=24,
+        ).grid(row=4, column=1, columnspan=2, sticky='ew', pady=(0, 10))
+
+        sfx_names = ["None"] + intro_creator.list_sound_effects(self.get_sound_effects_dir())
+
+        ttk.Label(body, text="Line 1 text", style='Info.TLabel').grid(row=5, column=0, sticky='w')
+        line1_var = tk.StringVar()
+        ttk.Entry(body, textvariable=line1_var, width=32).grid(row=5, column=1, sticky='ew', pady=(0, 4))
+        line1_sfx_var = tk.StringVar(value="None")
+        ttk.Combobox(body, textvariable=line1_sfx_var, values=sfx_names, state='readonly', width=18).grid(
+            row=5, column=2, sticky='ew', pady=(0, 4)
+        )
+
+        use_line2_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            body,
+            text="Add second line (centered below line 1)",
+            variable=use_line2_var,
+        ).grid(row=6, column=0, columnspan=3, sticky='w', pady=(4, 4))
+
+        ttk.Label(body, text="Line 2 text", style='Info.TLabel').grid(row=7, column=0, sticky='w')
+        line2_var = tk.StringVar()
+        line2_entry = ttk.Entry(body, textvariable=line2_var, width=32)
+        line2_entry.grid(row=7, column=1, sticky='ew', pady=(0, 4))
+        line2_sfx_var = tk.StringVar(value="None")
+        line2_sfx_combo = ttk.Combobox(
+            body, textvariable=line2_sfx_var, values=sfx_names, state='readonly', width=18
+        )
+        line2_sfx_combo.grid(row=7, column=2, sticky='ew', pady=(0, 4))
+
+        ttk.Label(body, text="Output file name", style='Info.TLabel').grid(row=8, column=0, sticky='w')
+        output_var = tk.StringVar()
+        ttk.Entry(body, textvariable=output_var, width=32).grid(row=8, column=1, columnspan=2, sticky='ew', pady=(0, 6))
+        ttk.Label(
+            body,
+            text="Saved to your Intros folder. Leave blank to name from line 1.",
+            style='Info.TLabel',
+        ).grid(row=9, column=0, columnspan=3, sticky='w', pady=(0, 8))
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(body, textvariable=status_var, style='Info.TLabel', wraplength=500).grid(
+            row=10, column=0, columnspan=3, sticky='w'
+        )
+
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_columnconfigure(2, weight=1)
+
+        def toggle_line2():
+            state = 'normal' if use_line2_var.get() else 'disabled'
+            line2_entry.configure(state=state)
+            line2_sfx_combo.configure(state='readonly' if use_line2_var.get() else 'disabled')
+
+        def preview_lines():
+            lines = []
+            text1 = line1_var.get().strip()
+            if text1:
+                lines.append(text1)
+            if use_line2_var.get():
+                text2 = line2_var.get().strip()
+                if text2:
+                    lines.append(text2)
+            return lines
+
+        def apply_preview_image(pil_image):
+            photo = ImageTk.PhotoImage(pil_image)
+            preview_state["photo"] = photo
+            preview_image_label.configure(image=photo, width=pil_image.width, height=pil_image.height)
+
+        def redraw_preview_overlay():
+            if preview_state["frame"] is None:
+                return
+            try:
+                seconds_from_end = float(seconds_var.get())
+            except ValueError:
+                seconds_from_end = intro_creator.DEFAULT_SECONDS_FROM_END
+            rendered = intro_creator.render_intro_preview_image(
+                preview_state["frame"],
+                preview_lines(),
+                font_style=font_style_var.get(),
+                font_size_label=font_size_var.get(),
+            )
+            template = template_var.get()
+            preview_caption_var.set(
+                f"{template} — text at ~{seconds_from_end:.1f}s before end (final position)."
+            )
+            apply_preview_image(rendered)
+
+        def load_preview_frame_worker(frame_key):
+            template = template_var.get()
+            try:
+                seconds_from_end = float(seconds_var.get())
+            except ValueError:
+                seconds_from_end = intro_creator.DEFAULT_SECONDS_FROM_END
+
+            def worker():
+                try:
+                    frame = intro_creator.extract_template_frame_image(
+                        template,
+                        seconds_from_end,
+                        search_roots=search_roots,
+                        ffmpeg_path=self.get_ffmpeg_path(),
+                        ffprobe_path=ffprobe_path,
+                    )
+
+                    def apply_frame():
+                        preview_state["busy"] = False
+                        preview_state["frame"] = frame
+                        preview_state["frame_key"] = frame_key
+                        redraw_preview_overlay()
+
+                    window.after(0, apply_frame)
+                except Exception as exc:
+                    def show_error():
+                        preview_state["busy"] = False
+                        preview_caption_var.set(f"Preview unavailable: {exc}")
+
+                    window.after(0, show_error)
+
+            preview_state["busy"] = True
+            threading.Thread(target=worker, daemon=True).start()
+
+        def schedule_preview_refresh():
+            if preview_after_id["id"] is not None:
+                try:
+                    window.after_cancel(preview_after_id["id"])
+                except tk.TclError:
+                    pass
+
+            def refresh():
+                template = template_var.get()
+                try:
+                    seconds_from_end = float(seconds_var.get())
+                except ValueError:
+                    seconds_from_end = intro_creator.DEFAULT_SECONDS_FROM_END
+                frame_key = (template, round(seconds_from_end, 2))
+                if preview_state["frame_key"] == frame_key and preview_state["frame"] is not None:
+                    redraw_preview_overlay()
+                    return
+                if not preview_state["busy"]:
+                    load_preview_frame_worker(frame_key)
+
+            preview_after_id["id"] = window.after(200, refresh)
+
+        use_line2_var.trace_add('write', lambda *_args: toggle_line2())
+        toggle_line2()
+
+        preview_trace_vars = (
+            template_var,
+            seconds_var,
+            font_style_var,
+            font_size_var,
+            line1_var,
+            line2_var,
+            use_line2_var,
+        )
+        for var in preview_trace_vars:
+            var.trace_add('write', lambda *_args: schedule_preview_refresh())
+        schedule_preview_refresh()
+
+        button_row = ttk.Frame(window, style='Custom.TFrame', padding=(12, 0, 12, 12))
+        button_row.pack(fill='x', side='bottom')
+
+        def resolve_sfx_path(name):
+            if not name or name == "None":
+                return None
+            return os.path.join(self.get_sound_effects_dir(), name)
+
+        def unique_output_path(filename):
+            intro_dir = self.get_intro_dir()
+            os.makedirs(intro_dir, exist_ok=True)
+            base, ext = os.path.splitext(filename)
+            if not ext:
+                ext = ".mp4"
+            candidate = os.path.join(intro_dir, f"{base}{ext}")
+            counter = 2
+            while os.path.exists(candidate):
+                candidate = os.path.join(intro_dir, f"{base}_{counter}{ext}")
+                counter += 1
+            return candidate
+
+        def on_create():
+            line1 = line1_var.get().strip()
+            if not line1:
+                messagebox.showerror("Create Intro", "Enter text for line 1.")
+                return
+            prompts = [intro_creator.TextPromptSpec(line1, resolve_sfx_path(line1_sfx_var.get()))]
+            if use_line2_var.get():
+                line2 = line2_var.get().strip()
+                if line2:
+                    prompts.append(intro_creator.TextPromptSpec(line2, resolve_sfx_path(line2_sfx_var.get())))
+
+            try:
+                seconds_from_end = float(seconds_var.get())
+            except ValueError:
+                messagebox.showerror("Create Intro", "Seconds before end must be a number.")
+                return
+
+            filename = output_var.get().strip() or intro_creator.default_output_name(line1)
+            if not filename.lower().endswith(".mp4"):
+                filename = f"{filename}.mp4"
+            output_path = unique_output_path(filename)
+
+            create_btn.configure(state='disabled')
+            status_var.set("Building intro video...")
+
+            def worker():
+                ffprobe = os.path.join(os.path.dirname(self.get_ffmpeg_path()), "ffprobe.exe")
+                request = intro_creator.IntroBuildRequest(
+                    template_name=template_var.get(),
+                    output_path=output_path,
+                    prompts=prompts,
+                    seconds_from_end=seconds_from_end,
+                    font_style=font_style_var.get(),
+                    font_size_label=font_size_var.get(),
+                    animation=animation_var.get(),
+                    search_roots=self.get_intro_creator_search_roots(),
+                    ffmpeg_path=self.get_ffmpeg_path(),
+                    ffprobe_path=ffprobe,
+                )
+                ok, message = intro_creator.build_intro_video(request)
+
+                def finish():
+                    create_btn.configure(state='normal')
+                    if ok:
+                        stem = os.path.splitext(os.path.basename(output_path))[0]
+                        self.refresh_intro_list()
+                        self.intro_selection_var.set(stem)
+                        self.save_config()
+                        status_var.set(f"Created: {os.path.basename(output_path)}")
+                        self.log_success(f"[INTRO] Created custom intro: {output_path}")
+                        messagebox.showinfo(
+                            "Intro Created",
+                            f"Intro saved to:\n{output_path}\n\nIt is selected in the Intro Video dropdown.",
+                        )
+                        close_create_intro_window()
+                    else:
+                        status_var.set("Build failed.")
+                        self.log_error(f"[INTRO] Create failed: {message}")
+                        messagebox.showerror("Create Intro Failed", message)
+
+                self.root.after(0, finish)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        create_btn = tk.Button(
+            button_row,
+            text="Create Intro Video",
+            command=on_create,
+            bg=self.colors['accent'],
+            fg='white',
+            font=('Segoe UI', 10, 'bold'),
+            padx=12,
+            pady=6,
+            cursor='hand2',
+        )
+        create_btn.pack(side='left')
+        tk.Button(
+            button_row,
+            text="Cancel",
+            command=close_create_intro_window,
+            bg='#666666',
+            fg='white',
+            font=('Segoe UI', 9),
+            padx=10,
+            pady=6,
+            cursor='hand2',
+        ).pack(side='right')
 
     def add_intro_files(self):
         """Add one or more intro videos or GIFs."""
@@ -3302,12 +3759,14 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         timestamp = datetime.now().strftime("%H:%M:%S")
         message = str(message)
         
-        # Remove problematic Unicode characters for standalone EXE compatibility
-        safe_message = message
-        if getattr(sys, 'frozen', False):
-            # Running from executable - replace any remaining Unicode characters with ASCII
-            # Use only ASCII in the replacement process
-            safe_message = safe_message.encode('ascii', errors='replace').decode('ascii')
+        # Keep log/console output ASCII-safe on Windows (cp1252 console during early startup).
+        safe_message = (
+            message.replace("\u2192", "->")
+            .replace("\u2014", "-")
+            .replace("\u2013", "-")
+        )
+        if getattr(sys, "frozen", False) or self.status_text is None:
+            safe_message = safe_message.encode("ascii", errors="replace").decode("ascii")
 
         level_map = {
             "error": logging.ERROR,
@@ -3319,7 +3778,10 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         log_message = f"[{timestamp}] {safe_message}\n"
 
         if self.status_text is None:
-            print(log_message.rstrip())
+            try:
+                print(log_message.rstrip())
+            except UnicodeEncodeError:
+                print(log_message.encode("ascii", errors="replace").decode("ascii").rstrip())
             return
         
         try:
@@ -3443,8 +3905,26 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         window.geometry(f"{width}x{height}+{x}+{y}")
         window.lift(self.root)
         window.focus_force()
-        if modal:
-            window.grab_set()
+
+        def close_child_window():
+            try:
+                window.grab_release()
+            except tk.TclError:
+                pass
+            if getattr(self, "clip_preview_window", None) is window:
+                self.stop_preview()
+                self.clip_preview_window = None
+            if getattr(self, "license_recovery_window", None) is window:
+                self.license_recovery_window = None
+            if getattr(self, "checkout_window", None) is window:
+                self.checkout_window = None
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+        window.protocol("WM_DELETE_WINDOW", close_child_window)
+        # Avoid grab_set: it blocks closing the main window from the taskbar on Windows.
     
     # Donation system methods
     def open_venmo(self):
@@ -3934,7 +4414,6 @@ To send a donation:
         window.title(title)
         window.resizable(False, False)
         window.transient(self.root)
-        window.grab_set()
         self._update_progress_var = tk.DoubleVar(value=0)
         ttk.Label(window, text="Downloading update (~200 MB)...", padding=12).pack()
         self._update_progress_label = ttk.Label(window, text="Starting...", padding=(12, 0))
@@ -3944,12 +4423,15 @@ To send a donation:
         self._center_toplevel(window)
         self._update_progress_window = window
 
-    def _center_toplevel(self, window):
+    def _center_toplevel(self, window, width=None, height=None):
         window.update_idletasks()
-        width = window.winfo_width()
-        height = window.winfo_height()
-        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
-        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+        if width and height:
+            window.geometry(f"{width}x{height}")
+            window.update_idletasks()
+        win_w = window.winfo_width()
+        win_h = window.winfo_height()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - win_w) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - win_h) // 2)
         window.geometry(f"+{x}+{y}")
 
     def _set_update_progress(self, percent, label):
@@ -4085,33 +4567,153 @@ del "%~f0"
             if not self.updater_batch_path:
                 self._update_download_active = False
 
+    def _close_all_child_windows(self):
+        """Close dialogs and release modal grabs so the main window can exit."""
+        self.stop_preview()
+        self._close_update_progress()
+
+        tracked = (
+            getattr(self, "clip_preview_window", None),
+            getattr(self, "license_recovery_window", None),
+            getattr(self, "checkout_window", None),
+            getattr(self, "_create_intro_window", None),
+            getattr(self, "_update_progress_window", None),
+        )
+        for win in tracked:
+            if win is None:
+                continue
+            try:
+                if win.winfo_exists():
+                    try:
+                        win.grab_release()
+                    except tk.TclError:
+                        pass
+                    win.destroy()
+            except tk.TclError:
+                pass
+
+        self.clip_preview_window = None
+        self.license_recovery_window = None
+        self.checkout_window = None
+        self._create_intro_window = None
+
+        try:
+            for child in list(self.root.winfo_children()):
+                try:
+                    child.grab_release()
+                except tk.TclError:
+                    pass
+                try:
+                    child.destroy()
+                except tk.TclError:
+                    pass
+        except tk.TclError:
+            pass
+
     def on_closing(self):
-        """Handle application closing"""
+        """Handle application closing (X button, Alt+F4, taskbar close)."""
+        if self._shutdown_in_progress:
+            os._exit(0)
+            return
+
+        if self.stop_requested is False and hasattr(self, "run_btn"):
+            try:
+                btn_text = str(self.run_btn.cget("text") or "")
+                if "Compiling" in btn_text:
+                    if not messagebox.askyesno(
+                        "Compilation Running",
+                        "A compilation is still running.\n\nClose anyway?",
+                    ):
+                        return
+            except tk.TclError:
+                pass
+
+        self._shutdown_in_progress = True
+        self.stop_requested = True
         self.stop_folder_monitoring()
-        self.save_config()
-        
-        # Run updater batch file if pending
-        if hasattr(self, 'updater_batch_path') and os.path.exists(self.updater_batch_path):
-            # Run batch file silently in background - completely detached from parent process
-            subprocess.Popen(['cmd.exe', '/c', self.updater_batch_path], 
-                           creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-                           close_fds=True,
-                           shell=False)
-        
-        self.root.destroy()
-        
-        # Ensure clean exit for PyInstaller apps
-        import sys
-        sys.exit(0)
-    
+        self._close_all_child_windows()
+
+        try:
+            self.save_config()
+        except Exception:
+            pass
+
+        self._remove_gui_pid_file()
+
+        updater_batch = getattr(self, "updater_batch_path", None)
+        if updater_batch and os.path.exists(updater_batch):
+            try:
+                subprocess.Popen(
+                    ["cmd.exe", "/c", updater_batch],
+                    creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                    close_fds=True,
+                    shell=False,
+                )
+            except Exception:
+                pass
+
+        try:
+            self.root.quit()
+        except tk.TclError:
+            pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+        os._exit(0)
+
     def run(self):
         """Start the GUI application"""
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.mainloop()
+
+
+def ensure_single_instance():
+    """Prevent multiple GUI instances (common cause of 'stuck' taskbar entries)."""
+    if os.name != "nt":
+        return True
+    import ctypes
+
+    mutex_name = "Global\\KnightLogics.AutoVideoCompiler.SingleInstance"
+    ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
+    if ctypes.windll.kernel32.GetLastError() != 183:
+        return True
+
+    pid_hint = ""
+    pid_path = os.path.join(get_app_storage_dir(), "gui.pid")
+    if os.path.isfile(pid_path):
+        try:
+            with open(pid_path, "r", encoding="utf-8") as handle:
+                existing_pid = int((handle.readline() or "").strip())
+            pid_hint = (
+                f"\n\nRunning GUI process ID: {existing_pid}\n"
+                "Task Manager > Details > Command line contains UOVidCompiler_GUI.py"
+            )
+        except (OSError, ValueError):
+            pass
+
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "Already Running",
+            "Auto Video Compiler is already open.\n\n"
+            "Check the taskbar for the existing window."
+            f"{pid_hint}\n\n"
+            "To force-close only this app, run Kill-AutoVideoCompiler-GUI.ps1 "
+            "in the project folder (does not stop other Python programs).",
+        )
+        root.destroy()
+    except Exception:
+        pass
+    return False
+
 
 def main():
     """Main application entry point"""
     try:
+        if not ensure_single_instance():
+            return
         app = UOVidCompilerGUI()
         app.run()
     except Exception as e:
