@@ -6,6 +6,7 @@ This folder contains the FFmpeg executables needed for video processing. **No se
 
 - **ffmpeg.exe** - Main video processing engine
 - **ffprobe.exe** - Video analysis tool for getting file information
+- **ffplay.exe** - Audio/video playback for intro preview (sound effects in preview)
 
 ## 🎯 Why Included?
 
@@ -30,6 +31,7 @@ The script automatically uses these executables via:
 ```python
 FFMPEG_PATH = os.path.join(SCRIPT_DIR, "ffmpeg", "ffmpeg.exe")
 FFPROBE_PATH = os.path.join(SCRIPT_DIR, "ffmpeg", "ffprobe.exe")
+FFPLAY_PATH = os.path.join(SCRIPT_DIR, "ffmpeg", "ffplay.exe")
 ```
 
 All FFmpeg commands in the script reference these local executables instead of expecting FFmpeg to be in the system PATH.

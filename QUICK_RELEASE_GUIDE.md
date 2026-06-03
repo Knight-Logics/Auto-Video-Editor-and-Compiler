@@ -59,7 +59,7 @@ Users will automatically see update prompt next time they launch the app.
 - **Major change**: `1.2.0` → `2.0.0`
 
 ## Current Version
-**v1.2.1** - Knight Logics updater path and trim handling fix
+**v1.3.8** - Intro cuts on template animation end; long SFX continues over gameplay clips
 
 ## Next Release Checklist
 - [ ] Update VERSION in UOVidCompiler_GUI.py

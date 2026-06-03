@@ -19,6 +19,8 @@ import os
 import json
 import subprocess
 import sys
+
+from process_utils import hidden_creationflags, popen_hidden, run_hidden
 import webbrowser
 import urllib.parse
 import logging
@@ -58,6 +60,20 @@ try:
 except ImportError:
     intro_creator = None
     INTRO_CREATOR_AVAILABLE = False
+
+try:
+    from intro_creator_dialog import IntroCreatorDialog
+    INTRO_CREATOR_DIALOG_AVAILABLE = True
+except ImportError:
+    IntroCreatorDialog = None
+    INTRO_CREATOR_DIALOG_AVAILABLE = False
+
+try:
+    from clip_video_player import ClipVideoPlayer
+    CLIP_VIDEO_PLAYER_AVAILABLE = True
+except ImportError:
+    ClipVideoPlayer = None
+    CLIP_VIDEO_PLAYER_AVAILABLE = False
 
 
 def get_autovid_license() -> ModuleType:
@@ -106,7 +122,7 @@ class CompilerGuiLogHandler(logging.Handler):
 
 class UOVidCompilerGUI:
     # Version info for auto-updates
-    VERSION = "1.3.7"  # Update this when releasing new versions
+    VERSION = "1.3.8"  # Update this when releasing new versions
     RELEASE_EXE_NAME = "Auto_Video_Compiler.exe"
     GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"  # GitHub repo for auto-updates
     UPDATE_USER_AGENT = "AutoVideoCompiler-Updater"
@@ -195,6 +211,7 @@ class UOVidCompilerGUI:
         self.clip_trim_inputs = {}
         self.clip_preview_window = None
         self.clip_preview_thumb = None
+        self._clip_video_player = None
         self._update_prompt_shown = False
         self._update_download_active = False
         self._update_progress_window = None
@@ -486,6 +503,7 @@ class UOVidCompilerGUI:
         # Initialize video configuration variables (moved from set_taskbar_icon)
         self.trim_seconds_var = tk.StringVar()
         self.music_selection_var = tk.StringVar()
+        self.music_after_intro_var = tk.BooleanVar(value=False)
         self.intro_selection_var = tk.StringVar()
         self.clip_order_var = tk.StringVar(value="newest_first")
         self.clip_timeframe_var = tk.StringVar(value="1_week")
@@ -608,7 +626,11 @@ class UOVidCompilerGUI:
             'text_bg': '#1e1e1e',      # Dark text area background
             'text_fg': '#00FF00',      # Bright green text for text areas
             'title_color': '#2E8B57',  # UO green for titles
-            'label_color': '#ffffff'   # White labels on charcoal background
+            'label_color': '#ffffff',  # White labels on charcoal background
+            'intro_bg': '#353535',
+            'intro_card': '#454545',
+            'intro_preview_bg': '#2a2a2a',
+            'intro_hint': '#b0b0b0',
         }
         
         # Configure root window with charcoal background
@@ -745,7 +767,7 @@ class UOVidCompilerGUI:
 
         quick_tips = (
             "Quick tips\n"
-            "• Double-click a clip thumbnail to preview\n"
+            "• Double-click a clip thumbnail to play it (right-click for clip length settings)\n"
             "• Bottom-right on each card: seconds from the end of that clip\n"
             "• Drag thumbnails to reorder; use timeframe bubbles to filter\n"
             "• Browse for input/output folders; Add Music… or Open folder for tracks\n"
@@ -1144,6 +1166,12 @@ class UOVidCompilerGUI:
         )
         music_link.pack(side='left', padx=(8, 0))
         music_link.bind('<Button-1>', lambda _event: self.open_music_folder())
+        ttk.Checkbutton(
+            music_tools,
+            text="Start after intro",
+            variable=self.music_after_intro_var,
+            command=self.save_config,
+        ).pack(side='left', padx=(10, 0))
 
         intro_options = self.get_available_intros()
         self.intro_selection_var.set(self.normalize_intro_selection(self.intro_selection_var.get() or "None"))
@@ -1943,389 +1971,10 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
         if not INTRO_CREATOR_AVAILABLE or intro_creator is None:
             messagebox.showerror("Intro Creator", "The intro creator module could not be loaded.")
             return
-        if not self.get_ffmpeg_path():
-            messagebox.showerror("Intro Creator", "FFmpeg was not found. Cannot build intro videos.")
+        if not INTRO_CREATOR_DIALOG_AVAILABLE or IntroCreatorDialog is None:
+            messagebox.showerror("Intro Creator", "The intro creator dialog could not be loaded.")
             return
-
-        if self._create_intro_window is not None:
-            try:
-                if self._create_intro_window.winfo_exists():
-                    self._create_intro_window.lift()
-                    self._create_intro_window.focus_force()
-                    return
-            except tk.TclError:
-                self._create_intro_window = None
-
-        window = tk.Toplevel(self.root)
-        self._create_intro_window = window
-        window.title("Create Intro Video")
-        window.transient(self.root)
-        window.configure(bg=self.colors['frame_bg'])
-        self._center_toplevel(window, width=1020, height=680)
-
-        content = ttk.Frame(window, style='Custom.TFrame', padding=12)
-        content.pack(fill='both', expand=True)
-
-        body = ttk.Frame(content, style='Custom.TFrame')
-        body.pack(side='left', fill='both', expand=True, padx=(0, 12))
-
-        preview_panel = ttk.Frame(content, style='Custom.TFrame')
-        preview_panel.pack(side='right', fill='y')
-        ttk.Label(preview_panel, text="Preview", style='Heading.TLabel', font=('Segoe UI', 10, 'bold')).pack(
-            anchor='w', pady=(0, 6)
-        )
-        preview_image_label = tk.Label(
-            preview_panel,
-            bg='#101010',
-            relief='sunken',
-            borderwidth=2,
-            width=480,
-            height=270,
-        )
-        preview_image_label.pack()
-        preview_caption_var = tk.StringVar(
-            value="Shows template frame with text position (matches final overlay)."
-        )
-        ttk.Label(
-            preview_panel,
-            textvariable=preview_caption_var,
-            style='Info.TLabel',
-            wraplength=500,
-            justify='left',
-        ).pack(anchor='w', pady=(8, 0))
-
-        preview_state = {"frame": None, "frame_key": None, "photo": None, "busy": False}
-        ffprobe_path = os.path.join(os.path.dirname(self.get_ffmpeg_path()), "ffprobe.exe")
-        search_roots = self.get_intro_creator_search_roots()
-        preview_after_id = {"id": None}
-
-        def close_create_intro_window():
-            if preview_after_id["id"] is not None:
-                try:
-                    window.after_cancel(preview_after_id["id"])
-                except tk.TclError:
-                    pass
-                preview_after_id["id"] = None
-            try:
-                window.grab_release()
-            except tk.TclError:
-                pass
-            self._create_intro_window = None
-            window.destroy()
-
-        window.protocol("WM_DELETE_WINDOW", close_create_intro_window)
-
-        ttk.Label(body, text="Template", style='Info.TLabel').grid(row=0, column=0, sticky='w')
-        template_var = tk.StringVar(value=intro_creator.INTRO_TEMPLATE_NAMES[0])
-        ttk.Combobox(
-            body,
-            textvariable=template_var,
-            values=list(intro_creator.INTRO_TEMPLATE_NAMES),
-            state='readonly',
-            width=24,
-        ).grid(row=0, column=1, columnspan=2, sticky='ew', pady=(0, 6))
-
-        ttk.Label(body, text="Text appears (sec before end)", style='Info.TLabel').grid(row=1, column=0, sticky='w')
-        seconds_var = tk.StringVar(value=str(intro_creator.DEFAULT_SECONDS_FROM_END))
-        ttk.Spinbox(body, from_=0.3, to=15.0, increment=0.1, textvariable=seconds_var, width=10).grid(
-            row=1, column=1, sticky='w', pady=(0, 6)
-        )
-        ttk.Label(body, text="(1.5 recommended)", style='Info.TLabel').grid(row=1, column=2, sticky='w')
-
-        ttk.Label(body, text="Font style", style='Info.TLabel').grid(row=2, column=0, sticky='w')
-        font_style_var = tk.StringVar(value="Arial Bold")
-        ttk.Combobox(
-            body,
-            textvariable=font_style_var,
-            values=list(intro_creator.FONT_STYLES.keys()),
-            state='readonly',
-            width=24,
-        ).grid(row=2, column=1, columnspan=2, sticky='ew', pady=(0, 6))
-
-        ttk.Label(body, text="Text size", style='Info.TLabel').grid(row=3, column=0, sticky='w')
-        font_size_var = tk.StringVar(value="Large")
-        ttk.Combobox(
-            body,
-            textvariable=font_size_var,
-            values=list(intro_creator.FONT_SIZES.keys()),
-            state='readonly',
-            width=24,
-        ).grid(row=3, column=1, columnspan=2, sticky='ew', pady=(0, 6))
-
-        ttk.Label(body, text="Text animation", style='Info.TLabel').grid(row=4, column=0, sticky='w')
-        animation_var = tk.StringVar(value=intro_creator.ANIMATIONS[0])
-        ttk.Combobox(
-            body,
-            textvariable=animation_var,
-            values=list(intro_creator.ANIMATIONS),
-            state='readonly',
-            width=24,
-        ).grid(row=4, column=1, columnspan=2, sticky='ew', pady=(0, 10))
-
-        sfx_names = ["None"] + intro_creator.list_sound_effects(self.get_sound_effects_dir())
-
-        ttk.Label(body, text="Line 1 text", style='Info.TLabel').grid(row=5, column=0, sticky='w')
-        line1_var = tk.StringVar()
-        ttk.Entry(body, textvariable=line1_var, width=32).grid(row=5, column=1, sticky='ew', pady=(0, 4))
-        line1_sfx_var = tk.StringVar(value="None")
-        ttk.Combobox(body, textvariable=line1_sfx_var, values=sfx_names, state='readonly', width=18).grid(
-            row=5, column=2, sticky='ew', pady=(0, 4)
-        )
-
-        use_line2_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            body,
-            text="Add second line (centered below line 1)",
-            variable=use_line2_var,
-        ).grid(row=6, column=0, columnspan=3, sticky='w', pady=(4, 4))
-
-        ttk.Label(body, text="Line 2 text", style='Info.TLabel').grid(row=7, column=0, sticky='w')
-        line2_var = tk.StringVar()
-        line2_entry = ttk.Entry(body, textvariable=line2_var, width=32)
-        line2_entry.grid(row=7, column=1, sticky='ew', pady=(0, 4))
-        line2_sfx_var = tk.StringVar(value="None")
-        line2_sfx_combo = ttk.Combobox(
-            body, textvariable=line2_sfx_var, values=sfx_names, state='readonly', width=18
-        )
-        line2_sfx_combo.grid(row=7, column=2, sticky='ew', pady=(0, 4))
-
-        ttk.Label(body, text="Output file name", style='Info.TLabel').grid(row=8, column=0, sticky='w')
-        output_var = tk.StringVar()
-        ttk.Entry(body, textvariable=output_var, width=32).grid(row=8, column=1, columnspan=2, sticky='ew', pady=(0, 6))
-        ttk.Label(
-            body,
-            text="Saved to your Intros folder. Leave blank to name from line 1.",
-            style='Info.TLabel',
-        ).grid(row=9, column=0, columnspan=3, sticky='w', pady=(0, 8))
-
-        status_var = tk.StringVar(value="")
-        ttk.Label(body, textvariable=status_var, style='Info.TLabel', wraplength=500).grid(
-            row=10, column=0, columnspan=3, sticky='w'
-        )
-
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_columnconfigure(2, weight=1)
-
-        def toggle_line2():
-            state = 'normal' if use_line2_var.get() else 'disabled'
-            line2_entry.configure(state=state)
-            line2_sfx_combo.configure(state='readonly' if use_line2_var.get() else 'disabled')
-
-        def preview_lines():
-            lines = []
-            text1 = line1_var.get().strip()
-            if text1:
-                lines.append(text1)
-            if use_line2_var.get():
-                text2 = line2_var.get().strip()
-                if text2:
-                    lines.append(text2)
-            return lines
-
-        def apply_preview_image(pil_image):
-            photo = ImageTk.PhotoImage(pil_image)
-            preview_state["photo"] = photo
-            preview_image_label.configure(image=photo, width=pil_image.width, height=pil_image.height)
-
-        def redraw_preview_overlay():
-            if preview_state["frame"] is None:
-                return
-            try:
-                seconds_from_end = float(seconds_var.get())
-            except ValueError:
-                seconds_from_end = intro_creator.DEFAULT_SECONDS_FROM_END
-            rendered = intro_creator.render_intro_preview_image(
-                preview_state["frame"],
-                preview_lines(),
-                font_style=font_style_var.get(),
-                font_size_label=font_size_var.get(),
-            )
-            template = template_var.get()
-            preview_caption_var.set(
-                f"{template} — text at ~{seconds_from_end:.1f}s before end (final position)."
-            )
-            apply_preview_image(rendered)
-
-        def load_preview_frame_worker(frame_key):
-            template = template_var.get()
-            try:
-                seconds_from_end = float(seconds_var.get())
-            except ValueError:
-                seconds_from_end = intro_creator.DEFAULT_SECONDS_FROM_END
-
-            def worker():
-                try:
-                    frame = intro_creator.extract_template_frame_image(
-                        template,
-                        seconds_from_end,
-                        search_roots=search_roots,
-                        ffmpeg_path=self.get_ffmpeg_path(),
-                        ffprobe_path=ffprobe_path,
-                    )
-
-                    def apply_frame():
-                        preview_state["busy"] = False
-                        preview_state["frame"] = frame
-                        preview_state["frame_key"] = frame_key
-                        redraw_preview_overlay()
-
-                    window.after(0, apply_frame)
-                except Exception as exc:
-                    def show_error():
-                        preview_state["busy"] = False
-                        preview_caption_var.set(f"Preview unavailable: {exc}")
-
-                    window.after(0, show_error)
-
-            preview_state["busy"] = True
-            threading.Thread(target=worker, daemon=True).start()
-
-        def schedule_preview_refresh():
-            if preview_after_id["id"] is not None:
-                try:
-                    window.after_cancel(preview_after_id["id"])
-                except tk.TclError:
-                    pass
-
-            def refresh():
-                template = template_var.get()
-                try:
-                    seconds_from_end = float(seconds_var.get())
-                except ValueError:
-                    seconds_from_end = intro_creator.DEFAULT_SECONDS_FROM_END
-                frame_key = (template, round(seconds_from_end, 2))
-                if preview_state["frame_key"] == frame_key and preview_state["frame"] is not None:
-                    redraw_preview_overlay()
-                    return
-                if not preview_state["busy"]:
-                    load_preview_frame_worker(frame_key)
-
-            preview_after_id["id"] = window.after(200, refresh)
-
-        use_line2_var.trace_add('write', lambda *_args: toggle_line2())
-        toggle_line2()
-
-        preview_trace_vars = (
-            template_var,
-            seconds_var,
-            font_style_var,
-            font_size_var,
-            line1_var,
-            line2_var,
-            use_line2_var,
-        )
-        for var in preview_trace_vars:
-            var.trace_add('write', lambda *_args: schedule_preview_refresh())
-        schedule_preview_refresh()
-
-        button_row = ttk.Frame(window, style='Custom.TFrame', padding=(12, 0, 12, 12))
-        button_row.pack(fill='x', side='bottom')
-
-        def resolve_sfx_path(name):
-            if not name or name == "None":
-                return None
-            return os.path.join(self.get_sound_effects_dir(), name)
-
-        def unique_output_path(filename):
-            intro_dir = self.get_intro_dir()
-            os.makedirs(intro_dir, exist_ok=True)
-            base, ext = os.path.splitext(filename)
-            if not ext:
-                ext = ".mp4"
-            candidate = os.path.join(intro_dir, f"{base}{ext}")
-            counter = 2
-            while os.path.exists(candidate):
-                candidate = os.path.join(intro_dir, f"{base}_{counter}{ext}")
-                counter += 1
-            return candidate
-
-        def on_create():
-            line1 = line1_var.get().strip()
-            if not line1:
-                messagebox.showerror("Create Intro", "Enter text for line 1.")
-                return
-            prompts = [intro_creator.TextPromptSpec(line1, resolve_sfx_path(line1_sfx_var.get()))]
-            if use_line2_var.get():
-                line2 = line2_var.get().strip()
-                if line2:
-                    prompts.append(intro_creator.TextPromptSpec(line2, resolve_sfx_path(line2_sfx_var.get())))
-
-            try:
-                seconds_from_end = float(seconds_var.get())
-            except ValueError:
-                messagebox.showerror("Create Intro", "Seconds before end must be a number.")
-                return
-
-            filename = output_var.get().strip() or intro_creator.default_output_name(line1)
-            if not filename.lower().endswith(".mp4"):
-                filename = f"{filename}.mp4"
-            output_path = unique_output_path(filename)
-
-            create_btn.configure(state='disabled')
-            status_var.set("Building intro video...")
-
-            def worker():
-                ffprobe = os.path.join(os.path.dirname(self.get_ffmpeg_path()), "ffprobe.exe")
-                request = intro_creator.IntroBuildRequest(
-                    template_name=template_var.get(),
-                    output_path=output_path,
-                    prompts=prompts,
-                    seconds_from_end=seconds_from_end,
-                    font_style=font_style_var.get(),
-                    font_size_label=font_size_var.get(),
-                    animation=animation_var.get(),
-                    search_roots=self.get_intro_creator_search_roots(),
-                    ffmpeg_path=self.get_ffmpeg_path(),
-                    ffprobe_path=ffprobe,
-                )
-                ok, message = intro_creator.build_intro_video(request)
-
-                def finish():
-                    create_btn.configure(state='normal')
-                    if ok:
-                        stem = os.path.splitext(os.path.basename(output_path))[0]
-                        self.refresh_intro_list()
-                        self.intro_selection_var.set(stem)
-                        self.save_config()
-                        status_var.set(f"Created: {os.path.basename(output_path)}")
-                        self.log_success(f"[INTRO] Created custom intro: {output_path}")
-                        messagebox.showinfo(
-                            "Intro Created",
-                            f"Intro saved to:\n{output_path}\n\nIt is selected in the Intro Video dropdown.",
-                        )
-                        close_create_intro_window()
-                    else:
-                        status_var.set("Build failed.")
-                        self.log_error(f"[INTRO] Create failed: {message}")
-                        messagebox.showerror("Create Intro Failed", message)
-
-                self.root.after(0, finish)
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        create_btn = tk.Button(
-            button_row,
-            text="Create Intro Video",
-            command=on_create,
-            bg=self.colors['accent'],
-            fg='white',
-            font=('Segoe UI', 10, 'bold'),
-            padx=12,
-            pady=6,
-            cursor='hand2',
-        )
-        create_btn.pack(side='left')
-        tk.Button(
-            button_row,
-            text="Cancel",
-            command=close_create_intro_window,
-            bg='#666666',
-            fg='white',
-            font=('Segoe UI', 9),
-            padx=10,
-            pady=6,
-            cursor='hand2',
-        ).pack(side='right')
+        IntroCreatorDialog(self).show()
 
     def add_intro_files(self):
         """Add one or more intro videos or GIFs."""
@@ -2671,7 +2320,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             ffmpeg_path = self.get_ffmpeg_path()
             if ffmpeg_path:
                 try:
-                    subprocess.run(
+                    run_hidden(
                         [
                             ffmpeg_path,
                             "-y",
@@ -2688,7 +2337,6 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         timeout=10,
-                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
                     )
                 except Exception:
                     pass
@@ -2743,7 +2391,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 preview_height = max(405, int(preview_width * 9 / 16))
                 left = self.root.winfo_x() + max(20, (self.root.winfo_width() - preview_width) // 2)
                 top = self.root.winfo_y() + max(20, (self.root.winfo_height() - preview_height) // 2)
-                self.preview_process = subprocess.Popen(
+                self.preview_process = popen_hidden(
                     [
                         ffplay_path,
                         "-autoexit",
@@ -2905,8 +2553,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
 
         tk.Button(
             button_row,
-            text="Play Over GUI",
-            command=lambda: self.preview_custom_order_video(video_path),
+            text="Play Video",
+            command=lambda: self.play_selected_clip_video(index),
             font=('Segoe UI', 8, 'bold'),
             bg=self.colors['accent'],
             fg='white',
@@ -2957,14 +2605,13 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
 
         tk.Label(
             outer,
-            text="Preview opens centered over the main GUI. Use ffplay controls for seek/fullscreen.",
+            text="Use Play Video for the built-in player, or adjust seconds below for this clip.",
             bg=self.colors['bg'],
             fg='#8ea3b8',
             font=('Segoe UI', 8),
         ).pack(pady=(10, 0))
 
         window.protocol("WM_DELETE_WINDOW", close_window)
-        self.preview_custom_order_video(video_path)
 
     def draw_clip_selection_rows(self):
         """Render the embedded clip-selection cards with a width-responsive multi-column layout."""
@@ -3081,7 +2728,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             self.clip_card_regions.append((index, x0, y0, x1, y1))
 
             canvas.tag_bind(row_tag, '<ButtonPress-1>', lambda _event, idx=index: self.start_clip_drag(idx))
-            canvas.tag_bind(row_tag, '<Double-Button-1>', lambda _event, idx=index: self.preview_selected_clip(idx))
+            canvas.tag_bind(row_tag, '<Double-Button-1>', lambda _event, idx=index: self.play_selected_clip_video(idx))
+            canvas.tag_bind(row_tag, '<Button-3>', lambda event, idx=index: self.show_clip_card_menu(event, idx))
             canvas.tag_bind(remove_tag, '<ButtonPress-1>', lambda _event, idx=index: self.remove_clip_at_index(idx))
 
         total_rows = (len(self.clip_selection_files) + columns - 1) // columns
@@ -3141,8 +2789,38 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             self.persist_clip_selection_snapshot(log_message=False)
         self.draw_clip_selection_rows()
 
+    def play_selected_clip_video(self, index=None):
+        """Open the built-in clip player (double-click thumbnail)."""
+        if not self.clip_selection_files:
+            return
+        if index is None:
+            index = self.clip_selected_index
+        index = max(0, min(len(self.clip_selection_files) - 1, index))
+        self.clip_selected_index = index
+        self.draw_clip_selection_rows()
+        video_path = self.clip_selection_files[index]
+        if CLIP_VIDEO_PLAYER_AVAILABLE and ClipVideoPlayer is not None:
+            ClipVideoPlayer(self, video_path).show()
+        else:
+            self.preview_custom_order_video(video_path)
+
+    def show_clip_card_menu(self, event, index):
+        """Right-click menu on a clip card."""
+        if not self.clip_selection_files:
+            return
+        index = max(0, min(len(self.clip_selection_files) - 1, index))
+        self.clip_selected_index = index
+        self.draw_clip_selection_rows()
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Play video", command=lambda: self.play_selected_clip_video(index))
+        menu.add_command(label="Adjust clip length...", command=lambda: self.show_clip_preview_window(index))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def preview_selected_clip(self, index=None):
-        """Open the selected clip's centered preview/editor window."""
+        """Open the clip length editor (right-click Adjust clip length)."""
         if not self.clip_selection_files:
             return
         if index is None:
@@ -3317,6 +2995,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             os.environ['VIDEO_OUTPUT_PATH'] = self.output_path_var.get()
             os.environ['TRIM_SECONDS'] = self.trim_seconds_var.get()
             os.environ['MUSIC_SELECTION'] = self.music_selection_var.get()
+            os.environ['MUSIC_AFTER_INTRO'] = '1' if self.music_after_intro_var.get() else '0'
             os.environ['INTRO_SELECTION'] = self.intro_selection_for_compiler()
             os.environ['CLIP_ORDER'] = self.clip_order_var.get()
             os.environ['CUSTOM_ORDER_FILE'] = self.custom_order_file
@@ -3329,6 +3008,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             # Log the settings being used
             self.log_status(f"[CONFIG] Trim seconds: {self.trim_seconds_var.get()}")
             self.log_status(f"[CONFIG] Music selection: {self.music_selection_var.get()}")
+            if self.music_after_intro_var.get():
+                self.log_status("[CONFIG] Background music: starts after intro")
             self.log_status(f"[CONFIG] Intro selection: {self.intro_selection_for_compiler()}")
             self.log_status(f"[CONFIG] Clip order: {self.clip_order_var.get()}")
             self.log_status(f"[CONFIG] Clip timeframe: {self.get_clip_timeframe_label()}")
@@ -3347,6 +3028,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                     trim_value = None if trim_selection == 'None' else int(trim_selection)
                     UOVidCompiler.CONFIG['intro_selection'] = self.intro_selection_for_compiler()
                     UOVidCompiler.CONFIG['music_selection'] = self.music_selection_var.get()
+                    UOVidCompiler.CONFIG['music_after_intro'] = bool(self.music_after_intro_var.get())
                     UOVidCompiler.CONFIG['trim_seconds'] = trim_value
                     UOVidCompiler.CONFIG['clip_duration'] = float(trim_value) if trim_value is not None else 999999.0
                     UOVidCompiler.CONFIG['video_folder'] = self.input_path_var.get()
@@ -3482,6 +3164,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             env['VIDEO_OUTPUT_PATH'] = self.output_path_var.get()
             env['TRIM_SECONDS'] = self.trim_seconds_var.get()
             env['MUSIC_SELECTION'] = self.music_selection_var.get()
+            env['MUSIC_AFTER_INTRO'] = '1' if self.music_after_intro_var.get() else '0'
             env['INTRO_SELECTION'] = self.intro_selection_for_compiler()
             env['CLIP_ORDER'] = self.clip_order_var.get()
             env['CUSTOM_ORDER_FILE'] = self.custom_order_file
@@ -3493,7 +3176,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
 
             self.log_status(f"[LOG] Subprocess diagnostics directory: {env['AUTOVID_LOG_DIR']}")
             
-            process = subprocess.Popen(
+            process = popen_hidden(
                 [sys.executable, "-u", script_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -3501,7 +3184,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 cwd=os.path.dirname(__file__),
                 env=env,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
             )
             
             line_count = 0
@@ -3537,12 +3220,12 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 script_path = os.path.join(os.path.dirname(__file__), "test_subprocess.py")
                 
                 # Simple approach - no fancy buffering
-                process = subprocess.Popen(
+                process = popen_hidden(
                     [sys.executable, script_path],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    universal_newlines=True
+                    universal_newlines=True,
                 )
                 
                 # Read all output
@@ -3838,6 +3521,7 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
                 "output_path": getattr(self, 'output_path_var', tk.StringVar()).get(),
                 "trim_seconds": getattr(self, 'trim_seconds_var', tk.StringVar()).get(),
                 "music_selection": getattr(self, 'music_selection_var', tk.StringVar()).get(),
+                "music_after_intro": bool(getattr(self, 'music_after_intro_var', tk.BooleanVar(value=False)).get()),
                 "intro_selection": getattr(self, 'intro_selection_var', tk.StringVar()).get(),
                 "clip_order": getattr(self, 'clip_order_var', tk.StringVar(value="newest_first")).get(),
                 "clip_timeframe": getattr(self, 'clip_timeframe_var', tk.StringVar(value="1_week")).get()
@@ -3860,6 +3544,8 @@ Ready to compile? Configure your settings above and click "Compile Videos"!
             self.trim_seconds_var.set(self.config.get("trim_seconds") or "15")
         if hasattr(self, 'music_selection_var'):
             self.music_selection_var.set(self.config.get("music_selection") or "None")
+        if hasattr(self, 'music_after_intro_var'):
+            self.music_after_intro_var.set(bool(self.config.get("music_after_intro", False)))
         if hasattr(self, 'intro_selection_var'):
             self.intro_selection_var.set(
                 self.normalize_intro_selection(self.config.get("intro_selection") or "None")
@@ -4570,6 +4256,13 @@ del "%~f0"
     def _close_all_child_windows(self):
         """Close dialogs and release modal grabs so the main window can exit."""
         self.stop_preview()
+        player = getattr(self, "_clip_video_player", None)
+        if player is not None:
+            try:
+                player.close()
+            except Exception:
+                pass
+        self._clip_video_player = None
         self._close_update_progress()
 
         tracked = (
@@ -4643,9 +4336,9 @@ del "%~f0"
         updater_batch = getattr(self, "updater_batch_path", None)
         if updater_batch and os.path.exists(updater_batch):
             try:
-                subprocess.Popen(
+                popen_hidden(
                     ["cmd.exe", "/c", updater_batch],
-                    creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                    creationflags=hidden_creationflags(getattr(subprocess, "DETACHED_PROCESS", 0x00000008)),
                     close_fds=True,
                     shell=False,
                 )

@@ -15,6 +15,9 @@ BMagic_AutoVidCompiler_STANDALONE_Distribution/ffmpeg/
 logs/
 *.log
 gui_config.json
+gui.pid
+thumbnail-cache/
+custom_clip_order.json
 
 # OS files
 .DS_Store

@@ -17,7 +17,10 @@ Completely self-contained package - no external dependencies!
 
 import os
 import json
+import re
 import subprocess
+
+from process_utils import popen_hidden, run_hidden
 import random
 import glob
 import shutil
@@ -180,6 +183,7 @@ VIDEO_OUTPUT_PATH = os.environ.get('VIDEO_OUTPUT_PATH', os.path.expanduser(r"~/D
 trim_value = os.environ.get('TRIM_SECONDS', '15')
 TRIM_SECONDS = int(trim_value) if trim_value != 'None' else None  # None means use full video length
 MUSIC_SELECTION = os.environ.get('MUSIC_SELECTION', '')  # 'None' means no music
+MUSIC_AFTER_INTRO = os.environ.get('MUSIC_AFTER_INTRO', '0').strip().lower() in ('1', 'true', 'yes')
 INTRO_SELECTION = os.environ.get('INTRO_SELECTION', '')  # 'None' means no intro
 CLIP_ORDER = os.environ.get('CLIP_ORDER', 'newest_first')
 CUSTOM_ORDER_FILE = os.environ.get('CUSTOM_ORDER_FILE', '')
@@ -204,6 +208,7 @@ CONFIG = {
     # Video configuration
     "trim_seconds": TRIM_SECONDS,
     "music_selection": MUSIC_SELECTION,
+    "music_after_intro": MUSIC_AFTER_INTRO,
     "intro_selection": INTRO_SELECTION,
     "clip_order": CLIP_ORDER,
     "custom_order_file": CUSTOM_ORDER_FILE,
@@ -378,7 +383,7 @@ def terminate_process_tree(process):
         return
     try:
         if os.name == "nt":
-            subprocess.run(
+            run_hidden(
                 ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -403,13 +408,12 @@ def run_ffmpeg_command(command, timeout=60):
         if cancellation_requested():
             return False, "", "Cancelled by user"
         popen_command = shlex.split(command) if os.name == "nt" and isinstance(command, str) else command
-        process = subprocess.Popen(
+        process = popen_hidden(
             popen_command,
             shell=os.name != "nt",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
         )
         deadline = time.time() + timeout if timeout else None
         while True:
@@ -542,38 +546,221 @@ def has_audio_stream(video_path):
             return False
     return False
 
-def extract_intro_clip(input_path, output_path, max_duration=7.0):
-    """Extract intro clip from the beginning of a video (not the end like gameplay clips)"""
-    
-    width, height, total_duration = get_video_info(input_path)
-    
-    if total_duration is None or total_duration <= 0:
+def ffprobe_stream_duration(video_path, stream_selector):
+    """Read one stream's duration (v:0 or a:0) without using container length."""
+    command = (
+        f'"{FFPROBE_PATH}" -v error -select_streams {stream_selector} '
+        f'-show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
+    )
+    success, stdout, stderr = run_ffmpeg_command(command)
+    if not success:
+        return None
+    try:
+        value = float((stdout or "").strip())
+        return value if value > 0 else None
+    except ValueError:
+        return None
+
+
+def probe_av_stream_durations(video_path):
+    """Return (video_duration, audio_duration) from per-stream metadata."""
+    video_duration = ffprobe_stream_duration(video_path, "v:0")
+    audio_duration = ffprobe_stream_duration(video_path, "a:0")
+    if video_duration is None:
+        _, _, container_duration = get_video_info(video_path)
+        video_duration = container_duration
+    if audio_duration is None:
+        audio_duration = video_duration
+    return video_duration, audio_duration
+
+
+def read_intro_format_tags(intro_path):
+    """Read visual_duration / template_name embedded in the MP4 by the intro creator."""
+    command = (
+        f'"{FFPROBE_PATH}" -v error -show_entries format_tags '
+        f'-of json "{intro_path}"'
+    )
+    success, stdout, stderr = run_ffmpeg_command(command)
+    if not success:
+        return None, None
+    try:
+        data = json.loads(stdout or "{}")
+        tags = data.get("format", {}).get("tags", {}) or {}
+    except (json.JSONDecodeError, AttributeError):
+        return None, None
+
+    visual = None
+    template_name = (tags.get("template_name") or "").strip() or None
+    raw_visual = tags.get("visual_duration")
+    if raw_visual is not None:
+        try:
+            visual = float(raw_visual)
+        except (TypeError, ValueError):
+            visual = None
+    return visual, template_name
+
+
+def probe_template_visual_duration(template_name):
+    """Return the raw template clip length (Blue, Lion, etc.) when known."""
+    if not template_name:
+        return None
+    try:
+        from intro_creator import INTRO_TEMPLATE_NAMES, resolve_template_path
+
+        if template_name not in INTRO_TEMPLATE_NAMES:
+            return None
+        template_path = resolve_template_path(template_name, [SCRIPT_DIR])
+        return ffprobe_stream_duration(template_path, "v:0")
+    except Exception:
+        return None
+
+
+def detect_intro_freeze_end(intro_path, min_hold_tail=0.4):
+    """
+    Legacy intros padded the video stream to match long SFX (frozen last frame).
+    Returns the time when motion stops, or None if no meaningful freeze tail exists.
+    """
+    command = (
+        f'"{FFMPEG_PATH}" -hide_banner -i "{intro_path}" '
+        f'-vf "freezedetect=n=-60dB:d=0.5" -an -f null -'
+    )
+    success, stdout, stderr = run_ffmpeg_command(command, timeout=90)
+    if not success:
+        return None
+
+    video_duration, _ = probe_av_stream_durations(intro_path)
+    if not video_duration or video_duration <= 0:
+        return None
+
+    freeze_start = None
+    for line in (stderr or "").splitlines():
+        match = re.search(r"freeze_start:\s*([0-9.]+)", line)
+        if match:
+            freeze_start = float(match.group(1))
+
+    if freeze_start is None:
+        return None
+    if freeze_start < 0.35:
+        return None
+    if video_duration - freeze_start < min_hold_tail:
+        return None
+    return freeze_start
+
+
+def resolve_intro_visual_duration(intro_path, max_duration=7.0):
+    """
+    How long the intro *video* should play before gameplay clips.
+    Prefer .meta.json / MP4 tags (template length), then freeze detection for legacy
+    padded files, then the video stream probe.
+    """
+    audio_duration = None
+
+    try:
+        from intro_creator import read_intro_metadata, read_intro_template_name
+
+        meta_visual, meta_audio = read_intro_metadata(intro_path)
+        if meta_visual:
+            visual = min(float(max_duration), float(meta_visual))
+            audio = float(meta_audio or meta_visual)
+            return visual, audio
+        template_name = read_intro_template_name(intro_path)
+    except ImportError:
+        template_name = None
+
+    tag_visual, tag_template = read_intro_format_tags(intro_path)
+    if tag_visual and tag_visual > 0:
+        visual = min(float(max_duration), float(tag_visual))
+        video_duration, audio_duration = probe_av_stream_durations(intro_path)
+        audio = float(audio_duration or tag_visual)
+        return visual, audio
+
+    if not template_name and tag_template:
+        template_name = tag_template
+
+    template_visual = probe_template_visual_duration(template_name)
+    if template_visual and template_visual > 0:
+        visual = min(float(max_duration), float(template_visual))
+        _, audio_duration = probe_av_stream_durations(intro_path)
+        audio = float(audio_duration or visual)
+        return visual, audio
+
+    video_duration, audio_duration = probe_av_stream_durations(intro_path)
+    if not video_duration or video_duration <= 0:
+        _, _, total_duration = get_video_info(intro_path)
+        video_duration = total_duration
+    if not audio_duration or audio_duration <= 0:
+        audio_duration = video_duration
+
+    freeze_end = detect_intro_freeze_end(intro_path)
+    if freeze_end and freeze_end > 0:
+        visual_duration = min(float(max_duration), float(freeze_end))
+        safe_print(
+            f"      [INTRO] Legacy hold detected — cutting intro video at {visual_duration:.2f}s "
+            f"(audio may continue over clips)"
+        )
+        try:
+            from intro_creator import write_intro_metadata
+
+            write_intro_metadata(intro_path, visual_duration, float(audio_duration), template_name)
+        except Exception:
+            pass
+        return visual_duration, float(audio_duration)
+
+    visual_duration = min(float(max_duration), float(video_duration))
+    return visual_duration, float(audio_duration)
+
+
+def extract_intro_clip(input_path, output_path, max_duration=7.0, tail_audio_path=None):
+    """
+    Prepare intro for compilation: video cuts at template length; optional SFX tail
+    overlaps the first gameplay clips.
+    Returns (success, visual_duration_seconds, tail_audio_created).
+    """
+    visual_duration, audio_duration = resolve_intro_visual_duration(input_path, max_duration)
+    if visual_duration <= 0:
         safe_print(f"[WARNING] Warning: Could not get duration for {input_path}")
-        return False
-    
-    # For intros, take from the beginning up to max_duration
-    start_time = 0
-    if total_duration <= max_duration:
-        # Use the entire intro if it's shorter than max_duration
-        extract_duration = total_duration
-    else:
-        # Take the first max_duration seconds
-        extract_duration = max_duration
-    
-    # Extract the intro clip from the beginning
+        return False, 0.0, False
+
+    cut = f"{visual_duration:.3f}"
+    vf = f"trim=duration={cut},setpts=PTS-STARTPTS"
+    af = f"atrim=0:{cut},asetpts=PTS-STARTPTS"
+
     if has_audio_stream(input_path):
-        # Video has audio - extract normally
-        command = f'"{FFMPEG_PATH}" -y -ss {start_time} -i "{input_path}" -t {extract_duration} -c:v libx264 -preset fast -crf 23 -c:a aac -b:a {CONFIG["audio_bitrate"]} "{output_path}"'
+        command = (
+            f'"{FFMPEG_PATH}" -y -ss 0 -i "{input_path}" '
+            f'-vf "{vf}" -af "{af}" '
+            f'-c:v libx264 -preset fast -crf 23 -c:a aac -b:a {CONFIG["audio_bitrate"]} "{output_path}"'
+        )
     else:
-        # Video has no audio - add silent audio track
-        command = f'"{FFMPEG_PATH}" -y -ss {start_time} -i "{input_path}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -t {extract_duration} -c:v libx264 -preset fast -crf 23 -c:a aac -b:a {CONFIG["audio_bitrate"]} -shortest "{output_path}"'
-    
-    success, stdout, stderr = run_ffmpeg_command(command, timeout=90)  # Give intro extraction more time
-    
+        command = (
+            f'"{FFMPEG_PATH}" -y -ss 0 -i "{input_path}" '
+            f'-vf "{vf}" '
+            f'-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -t {cut} '
+            f'-c:v libx264 -preset fast -crf 23 -c:a aac -b:a {CONFIG["audio_bitrate"]} -shortest "{output_path}"'
+        )
+
+    success, stdout, stderr = run_ffmpeg_command(command, timeout=90)
     if not success:
         safe_print(f"[ERROR] Error extracting intro from {input_path}: {stderr}")
-    
-    return success
+        return False, visual_duration, False
+
+    tail_created = False
+    tail_duration = audio_duration - visual_duration
+    if tail_audio_path and tail_duration > 0.08:
+        tail_command = (
+            f'"{FFMPEG_PATH}" -y -ss {visual_duration:.3f} -i "{input_path}" -t {tail_duration:.3f} '
+            f'-vn -c:a aac -b:a {CONFIG["audio_bitrate"]} "{tail_audio_path}"'
+        )
+        tail_ok, _, tail_err = run_ffmpeg_command(tail_command, timeout=60)
+        if tail_ok and os.path.isfile(tail_audio_path):
+            tail_created = True
+            safe_print(
+                f"      [INTRO] SFX continues {tail_duration:.1f}s over gameplay after intro video"
+            )
+        else:
+            safe_print(f"      [WARNING] Could not extract intro audio tail: {tail_err}")
+
+    return True, visual_duration, tail_created
 
 def extract_last_n_seconds(input_path, output_path, duration=5.0):
     """Extract the last N seconds from a video"""
@@ -1156,7 +1343,14 @@ def create_music_playlist(temp_dir, total_duration):
             logger.warning("Failed to create music playlist, using single track")
             return playlist_tracks[0]
 
-def concatenate_videos(video_list, output_path, music_playlist=None):
+def concatenate_videos(
+    video_list,
+    output_path,
+    music_playlist=None,
+    intro_audio_tail=None,
+    intro_visual_duration=0.0,
+    music_after_intro=False,
+):
     """Concatenate videos using FFmpeg with pre-normalization for reliability"""
     if not video_list:
         print("No videos to concatenate")
@@ -1173,13 +1367,32 @@ def concatenate_videos(video_list, output_path, music_playlist=None):
         for i, video in enumerate(video_list):
             safe_print(f"   [VIDEO] Normalizing video {i+1}/{len(video_list)}...")
             normalized_path = os.path.join(tempfile.gettempdir(), f"normalized_{i}.mp4")
-            
-            # Normalize each video to exact same parameters
+
+            if i == 0 and intro_visual_duration > 0.05:
+                intro_cut = f"{intro_visual_duration:.3f}"
+                safe_print(
+                    f"      [INTRO] Hard trim to {intro_cut}s video (SFX may continue over clips after this)"
+                )
+                vf = (
+                    f"trim=duration={intro_cut},setpts=PTS-STARTPTS,"
+                    f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={CONFIG['output_fps']}"
+                )
+                af = (
+                    f"atrim=0:{intro_cut},asetpts=PTS-STARTPTS,"
+                    f"aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo"
+                )
+            else:
+                vf = (
+                    f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={CONFIG['output_fps']}"
+                )
+                af = "aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo"
+
             normalize_cmd = (
                 f'"{FFMPEG_PATH}" -y -i "{video}" '
-                f'-vf "scale={width}:{height}:force_original_aspect_ratio=decrease,'
-                f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={CONFIG["output_fps"]}" '
-                f'-af "aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo" '
+                f'-vf "{vf}" '
+                f'-af "{af}" '
                 f'-c:v libx264 -preset fast -b:v {CONFIG["video_bitrate"]} '
                 f'-c:a aac -b:a {CONFIG["audio_bitrate"]} '
                 f'"{normalized_path}"'
@@ -1211,30 +1424,73 @@ def concatenate_videos(video_list, output_path, music_playlist=None):
             safe_print(f"      [ERROR] Failed to concatenate videos")
             return False
         
-        # Step 3: Add background music if provided
-        if music_playlist:
-            safe_print(f"[MUSIC] Step 3: Adding background music...")
+        # Step 3: Mix audio (background music + optional intro SFX tail over gameplay)
+        has_tail = intro_audio_tail and os.path.isfile(intro_audio_tail) and intro_visual_duration >= 0
+        intro_delay_ms = int(float(intro_visual_duration) * 1000)
+        music_delay_ms = 0
+        if music_playlist and music_after_intro and intro_delay_ms > 0:
+            music_delay_ms = intro_delay_ms
+            safe_print(f"      [MUSIC] Background music starts after intro ({intro_visual_duration:.1f}s)")
+
+        if music_playlist or has_tail:
+            safe_print(f"[MUSIC] Step 3: Mixing final audio...")
+            inputs = [f'-i "{temp_video}"']
+            filter_parts = []
+            input_index = 1
+            music_stream = None
+
+            if music_playlist:
+                inputs.append(f'-i "{music_playlist}"')
+                if music_delay_ms > 0:
+                    filter_parts.append(
+                        f"[{input_index}:a]adelay={music_delay_ms}|{music_delay_ms}[musicbed]"
+                    )
+                    music_stream = "[musicbed]"
+                else:
+                    music_stream = f"[{input_index}:a]"
+                input_index += 1
+
+            if has_tail:
+                inputs.append(f'-i "{intro_audio_tail}"')
+                filter_parts.append(
+                    f"[{input_index}:a]adelay={intro_delay_ms}|{intro_delay_ms},volume=1.0[intro_tail]"
+                )
+                input_index += 1
+
+            if music_stream and has_tail:
+                filter_parts.append(
+                    f"[0:a]{music_stream}amix=inputs=2:duration=first:weights=1.0 0.4[bed];"
+                    "[bed][intro_tail]amix=inputs=2:duration=longest:dropout_transition=0[finalaudio]"
+                )
+            elif music_stream:
+                filter_parts.append(
+                    f"[0:a]{music_stream}amix=inputs=2:duration=first:weights=1.0 0.4[finalaudio]"
+                )
+            elif has_tail:
+                filter_parts.append(
+                    "[0:a][intro_tail]amix=inputs=2:duration=longest:dropout_transition=0[finalaudio]"
+                )
+
+            filter_complex = ";".join(filter_parts)
             final_command = (
-                f'"{FFMPEG_PATH}" -y -i "{temp_video}" -i "{music_playlist}" '
-                f'-filter_complex "[0:a][1:a]amix=inputs=2:duration=shortest:weights=1.0 0.4[finalaudio]" '
+                f'"{FFMPEG_PATH}" -y {" ".join(inputs)} '
+                f'-filter_complex "{filter_complex}" '
                 f'-map "0:v" -map "[finalaudio]" '
                 f'-c:v copy -c:a aac -b:a {CONFIG["audio_bitrate"]} '
                 f'"{output_path}"'
             )
-            
-            success, stdout, stderr = run_ffmpeg_command(final_command, timeout=240)  # Longest timeout for final music mixing
+
+            success, stdout, stderr = run_ffmpeg_command(final_command, timeout=240)
             if not success:
-                safe_print(f"      [WARNING] Failed to add background music, creating video without music...")
-                logger.warning(f"Music mixing failed: {stderr}")
-                # Fallback: create video without music instead of failing completely
+                safe_print(f"      [WARNING] Failed to mix final audio, saving without overlay...")
+                logger.warning(f"Final audio mix failed: {stderr}")
                 try:
                     shutil.move(temp_video, output_path)
-                    safe_print(f"      [OK] Video created successfully (without background music)")
+                    safe_print(f"      [OK] Video created (audio mix skipped)")
                 except Exception as e:
                     safe_print(f"      [ERROR] Failed to save video: {e}")
                     return False
         else:
-            # No music: just copy the concatenated video to final output
             shutil.move(temp_video, output_path)
         
         # Clean up temporary files
@@ -1246,6 +1502,8 @@ def concatenate_videos(video_list, output_path, music_playlist=None):
             for norm_video in normalized_videos:
                 if os.path.exists(norm_video):
                     os.remove(norm_video)
+            if intro_audio_tail and os.path.exists(intro_audio_tail):
+                os.remove(intro_audio_tail)
         except:
             pass
         
@@ -1558,6 +1816,8 @@ def create_compilation_video(video_files):
     
     # Step 3: Select intro (if enabled) 
     intro_clip_path = None
+    intro_audio_tail = None
+    intro_visual_duration = 0.0
     if CONFIG["use_intro"]:
         report_progress(76, "Processing intro")
         safe_print("\n[VIDEO] Step 3: Selecting intro video...")
@@ -1568,10 +1828,21 @@ def create_compilation_video(video_files):
             
             # Process intro video (extract and standardize like main videos)
             intro_clip_path = os.path.join(tempfile.gettempdir(), f"intro_{os.path.basename(intro_file)}")
-            
+            intro_tail_path = os.path.join(
+                tempfile.gettempdir(), f"intro_tail_{os.path.basename(intro_file)}.m4a"
+            )
+
             try:
-                if extract_intro_clip(intro_file, intro_clip_path, CONFIG["intro_duration"]):
-                    safe_print(f"      [OK] Intro processed successfully")
+                ok, intro_visual_duration, tail_created = extract_intro_clip(
+                    intro_file,
+                    intro_clip_path,
+                    CONFIG["intro_duration"],
+                    tail_audio_path=intro_tail_path,
+                )
+                if ok:
+                    safe_print(f"      [OK] Intro processed successfully ({intro_visual_duration:.1f}s video)")
+                    if tail_created:
+                        intro_audio_tail = intro_tail_path
                 else:
                     safe_print(f"      [WARNING] Failed to process intro")
                     intro_clip_path = None
@@ -1597,7 +1868,14 @@ def create_compilation_video(video_files):
     
     try:
         # Use the existing concatenate_videos function (it takes 3 parameters)
-        success = concatenate_videos(processed_videos, output_path, music_playlist)
+        success = concatenate_videos(
+            processed_videos,
+            output_path,
+            music_playlist,
+            intro_audio_tail=intro_audio_tail,
+            intro_visual_duration=intro_visual_duration,
+            music_after_intro=bool(CONFIG.get("music_after_intro")),
+        )
         
         if success and os.path.exists(output_path):
             # Show final file info

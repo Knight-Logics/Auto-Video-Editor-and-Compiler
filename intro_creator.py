@@ -10,6 +10,8 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
+
+from process_utils import run_hidden
 from typing import List, Optional, Tuple
 
 INTRO_TEMPLATE_NAMES = ("Blue", "Blue2", "Lion", "Play", "Red", "UFO")
@@ -31,6 +33,9 @@ FONT_SIZES = {
 
 ANIMATIONS = ("Fade In", "Slide Up", "Pop", "Drop In")
 DEFAULT_SECONDS_FROM_END = 1.5
+DEFAULT_LINE2_DELAY = 0.75
+MIN_LINE2_DELAY = 0.5
+MAX_LINE2_DELAY = 3.0
 ANIMATION_DURATION = 0.45
 LINE_GAP_RATIO = 0.38
 
@@ -47,6 +52,7 @@ class IntroBuildRequest:
     output_path: str
     prompts: List[TextPromptSpec]
     seconds_from_end: float = DEFAULT_SECONDS_FROM_END
+    line2_delay: float = DEFAULT_LINE2_DELAY
     font_style: str = "Arial Bold"
     font_size_label: str = "Large"
     animation: str = "Fade In"
@@ -58,12 +64,11 @@ class IntroBuildRequest:
 
 def _run(cmd: List[str], timeout: int = 300) -> Tuple[bool, str]:
     try:
-        result = subprocess.run(
+        result = run_hidden(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         if result.returncode == 0:
             return True, result.stdout or ""
@@ -164,20 +169,18 @@ def _alpha_expr(t_start: float, anim_dur: float) -> str:
 
 
 def _y_expr(base_y: float, t_start: float, anim: str, anim_dur: float) -> str:
-    by = f"{base_y:.1f}"
+    y = float(base_y)
     if anim not in ("Slide Up", "Drop In"):
-        return by
+        return f"{y:.1f}"
     ts = f"{t_start:.3f}"
     ad = f"{anim_dur:.3f}"
     end = f"{t_start + anim_dur:.3f}"
-    if anim == "Slide Up":
-        return (
-            f"if(lt(t\\,{ts})\\,{by + 50}\\,"
-            f"if(lt(t\\,{end})\\,{by + 50}*(1-(t-{ts})/{ad})+{by}*((t-{ts})/{ad})\\,{by}))"
-        )
+    y_start = y + 50.0 if anim == "Slide Up" else y - 50.0
+    y0 = f"{y_start:.1f}"
+    y1 = f"{y:.1f}"
     return (
-        f"if(lt(t\\,{ts})\\,{by - 50}\\,"
-        f"if(lt(t\\,{end})\\,{by - 50}*(1-(t-{ts})/{ad})+{by}*((t-{ts})/{ad})\\,{by}))"
+        f"if(lt(t\\,{ts})\\,{y0}\\,"
+        f"if(lt(t\\,{end})\\,{y0}*(1-(t-{ts})/{ad})+{y1}*((t-{ts})/{ad})\\,{y1}))"
     )
 
 
@@ -197,6 +200,56 @@ def _line_y_positions(line_count: int, font_size: int, height: int) -> List[floa
     block_height = font_size * line_count + gap * max(0, line_count - 1)
     top = (height - block_height) / 2
     return [top + index * (font_size + gap) for index in range(line_count)]
+
+
+def intro_metadata_path(video_path: str) -> str:
+    return f"{video_path}.meta.json"
+
+
+def write_intro_metadata(
+    video_path: str,
+    visual_duration: float,
+    audio_duration: float,
+    template_name: Optional[str] = None,
+) -> None:
+    """Store template video length so compilation cuts on animation end, not SFX end."""
+    payload = {
+        "visual_duration": round(float(visual_duration), 4),
+        "audio_duration": round(float(audio_duration), 4),
+    }
+    if template_name:
+        payload["template_name"] = str(template_name)
+    with open(intro_metadata_path(video_path), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def read_intro_metadata(video_path: str) -> Tuple[Optional[float], Optional[float]]:
+    path = intro_metadata_path(video_path)
+    if not os.path.isfile(path):
+        return None, None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        visual = float(data.get("visual_duration") or 0)
+        audio = float(data.get("audio_duration") or 0)
+        if visual <= 0:
+            return None, None
+        return visual, audio if audio > 0 else visual
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None, None
+
+
+def read_intro_template_name(video_path: str) -> Optional[str]:
+    path = intro_metadata_path(video_path)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        name = (data.get("template_name") or "").strip()
+        return name or None
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
 
 
 def _sanitize_filename(name: str) -> str:
@@ -236,17 +289,23 @@ def build_intro_video(request: IntroBuildRequest) -> Tuple[bool, str]:
         return False, "Template video duration could not be read."
 
     appear_at = max(0.05, duration - float(request.seconds_from_end))
+    line2_delay = max(MIN_LINE2_DELAY, min(MAX_LINE2_DELAY, float(request.line2_delay)))
+    line_appear_times = [appear_at]
+    if len(prompts) > 1:
+        line_appear_times.append(appear_at + line2_delay)
+
     anim = request.animation if request.animation in ANIMATIONS else "Fade In"
     anim_dur = min(ANIMATION_DURATION, max(0.15, float(request.seconds_from_end) * 0.5))
-    alpha = _alpha_expr(appear_at, anim_dur)
     y_positions = _line_y_positions(len(prompts), font_size, height)
 
     filter_parts: List[str] = []
     last_v = "0:v"
     for index, prompt in enumerate(prompts):
+        t_start = line_appear_times[index]
         text = _escape_drawtext(prompt.text.strip())
-        y_expression = _y_expr(y_positions[index], appear_at, anim, anim_dur)
-        fs_expression = _fontsize_expr(font_size, appear_at, anim, anim_dur)
+        alpha = _alpha_expr(t_start, anim_dur)
+        y_expression = _y_expr(y_positions[index], t_start, anim, anim_dur)
+        fs_expression = _fontsize_expr(font_size, t_start, anim, anim_dur)
         out_v = f"v{index + 1}"
         filter_parts.append(
             f"[{last_v}]drawtext=fontfile='{font_path}':text='{text}':"
@@ -256,20 +315,16 @@ def build_intro_video(request: IntroBuildRequest) -> Tuple[bool, str]:
         )
         last_v = out_v
 
-    max_output_duration = duration
-    sfx_paths: List[str] = []
-    for prompt in prompts:
+    # Video always ends when the template ends (no frozen hold for long SFX).
+    # Audio may run longer and continues over gameplay during compilation.
+    audio_duration = duration
+    for index, prompt in enumerate(prompts):
         if prompt.sound_effect_path and os.path.isfile(prompt.sound_effect_path):
             sfx_meta = probe_media(ffprobe, prompt.sound_effect_path)
             sfx_dur = float(sfx_meta.get("duration") or 0)
-            max_output_duration = max(max_output_duration, appear_at + sfx_dur)
-            sfx_paths.append(prompt.sound_effect_path)
+            audio_duration = max(audio_duration, line_appear_times[index] + sfx_dur)
 
-    extra_video = max(0.0, max_output_duration - duration)
-    if extra_video > 0.01:
-        filter_parts.append(f"[{last_v}]tpad=stop_mode=clone:stop_duration={extra_video:.3f}[vout]")
-    else:
-        filter_parts.append(f"[{last_v}]copy[vout]")
+    filter_parts.append(f"[{last_v}]trim=duration={duration:.3f},setpts=PTS-STARTPTS[vout]")
 
     audio_labels: List[str] = []
     if media["has_audio"]:
@@ -282,21 +337,23 @@ def build_intro_video(request: IntroBuildRequest) -> Tuple[bool, str]:
         audio_labels.append("[basea]")
 
     cmd = [ffmpeg, "-y", "-i", template_path]
-    for sfx_path in sfx_paths:
-        cmd.extend(["-i", sfx_path])
-
-    delay_ms = int(appear_at * 1000)
-    for sfx_index, sfx_path in enumerate(sfx_paths, start=1):
-        label = f"sfx{sfx_index}"
-        filter_parts.append(f"[{sfx_index}:a]adelay={delay_ms}|{delay_ms},volume=1.0[{label}]")
+    sfx_input_index = 1
+    for index, prompt in enumerate(prompts):
+        if not prompt.sound_effect_path or not os.path.isfile(prompt.sound_effect_path):
+            continue
+        cmd.extend(["-i", prompt.sound_effect_path])
+        delay_ms = int(line_appear_times[index] * 1000)
+        label = f"sfx{sfx_input_index}"
+        filter_parts.append(f"[{sfx_input_index}:a]adelay={delay_ms}|{delay_ms},volume=1.0[{label}]")
         audio_labels.append(f"[{label}]")
+        sfx_input_index += 1
 
     mix_inputs = "".join(audio_labels)
     filter_parts.append(
         f"{mix_inputs}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0[a_mix]"
     )
     filter_parts.append(
-        f"[a_mix]apad=whole_dur={max_output_duration:.3f},atrim=0:{max_output_duration:.3f}[aout]"
+        f"[a_mix]apad=whole_dur={audio_duration:.3f},atrim=0:{audio_duration:.3f}[aout]"
     )
 
     filter_complex = ";".join(filter_parts)
@@ -319,14 +376,29 @@ def build_intro_video(request: IntroBuildRequest) -> Tuple[bool, str]:
             "aac",
             "-b:a",
             "192k",
-            "-t",
-            f"{max_output_duration:.3f}",
+            "-t:v",
+            f"{duration:.3f}",
+            "-t:a",
+            f"{audio_duration:.3f}",
+            "-metadata",
+            f"visual_duration={duration:.4f}",
+            "-metadata",
+            f"template_name={request.template_name}",
             request.output_path,
         ]
     )
 
     ok, err = _run(cmd, timeout=600)
     if ok and os.path.isfile(request.output_path):
+        try:
+            write_intro_metadata(
+                request.output_path,
+                duration,
+                audio_duration,
+                template_name=request.template_name,
+            )
+        except OSError:
+            pass
         return True, request.output_path
     return False, err or "Intro video was not created."
 
@@ -392,11 +464,10 @@ def extract_template_frame_image(
         "pipe:1",
     ]
     try:
-        result = subprocess.run(
+        result = run_hidden(
             cmd,
             capture_output=True,
             timeout=60,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception as exc:
         raise RuntimeError(str(exc)) from exc

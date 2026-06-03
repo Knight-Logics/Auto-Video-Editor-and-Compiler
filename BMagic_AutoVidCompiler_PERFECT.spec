@@ -18,7 +18,7 @@ a = Analysis(
         ('Red.mp4', '.'),
         ('UFO.mp4', '.'),
     ],
-    hiddenimports=[],
+    hiddenimports=['cv2'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
