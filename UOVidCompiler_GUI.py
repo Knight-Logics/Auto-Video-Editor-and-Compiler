@@ -99,7 +99,7 @@ class CompilerGuiLogHandler(logging.Handler):
 
 class UOVidCompilerGUI:
     # Version info for auto-updates
-    VERSION = "1.3.5"  # Update this when releasing new versions
+    VERSION = "1.3.6"  # Update this when releasing new versions
     RELEASE_EXE_NAME = "Auto_Video_Compiler.exe"
     GITHUB_REPO = "Knight-Logics/Auto-Video-Editor-and-Compiler"  # GitHub repo for auto-updates
     UPDATE_USER_AGENT = "AutoVideoCompiler-Updater"
@@ -112,6 +112,7 @@ class UOVidCompilerGUI:
     INTRO_EXTENSIONS = VIDEO_EXTENSIONS + ('.gif',)
     STOCK_INTRO_BASENAME = 'StockDefault'
     INTRO_OPTION_STOCK = 'Stock'
+    DEPRECATED_INTRO_BASENAMES = frozenset({'Why Knight Logics'})
     MUSIC_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac')
     CLIP_ORDER_OPTIONS = ('newest_first', 'oldest_first', 'filename_az', 'filename_za', 'custom')
     CLIP_TIMEFRAME_OPTIONS = (
@@ -348,8 +349,27 @@ class UOVidCompilerGUI:
         ]
         return next((path for path in candidates if path and os.path.exists(path)), "")
 
+    def remove_deprecated_intro_files(self):
+        """Remove legacy bundled intros that should not ship with the app."""
+        intro_dir = self.get_intro_dir()
+        if not os.path.isdir(intro_dir):
+            return
+        for name in os.listdir(intro_dir):
+            if not name.lower().endswith(self.INTRO_EXTENSIONS):
+                continue
+            stem = os.path.splitext(name)[0]
+            if stem not in self.DEPRECATED_INTRO_BASENAMES:
+                continue
+            path = os.path.join(intro_dir, name)
+            try:
+                os.remove(path)
+                print(f"Removed deprecated intro: {name}")
+            except OSError as e:
+                print(f"Could not remove deprecated intro {name}: {e}")
+
     def seed_media_folders(self):
         """Copy bundled starter media into persistent folders without overwriting user files."""
+        self.remove_deprecated_intro_files()
         for folder_name, extensions in (("Music", self.MUSIC_EXTENSIONS), ("Intros", self.INTRO_EXTENSIONS)):
             target_dir = os.path.join(self.storage_dir, folder_name)
             source_dir = os.path.join(self.bundle_dir, folder_name)
@@ -359,6 +379,10 @@ class UOVidCompilerGUI:
             for name in os.listdir(source_dir):
                 if not name.lower().endswith(extensions):
                     continue
+                if folder_name == "Intros":
+                    stem = os.path.splitext(name)[0]
+                    if stem != self.STOCK_INTRO_BASENAME or stem in self.DEPRECATED_INTRO_BASENAMES:
+                        continue
                 src = os.path.join(source_dir, name)
                 dst = os.path.join(target_dir, name)
                 if os.path.isfile(src) and not os.path.exists(dst):
